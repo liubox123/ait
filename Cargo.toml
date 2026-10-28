@@ -3,7 +3,7 @@ name = "ait"
 version = "0.1.0"
 edition = "2021"
 description = "面向 AI 协作开发的 Git"
-license = "MIT"
+license = "GPL-3.0-only"
 readme = "README.md"
 rust-version = "1.74"
 
