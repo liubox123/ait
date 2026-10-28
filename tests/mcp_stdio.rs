@@ -1,0 +1,123 @@
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use serde_json::json;
+
+fn temp_dir() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("ait-mcp-{}", ait::identity::random_token()));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn read_message(reader: &mut impl BufRead) -> serde_json::Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    if line.trim_start().starts_with('{') {
+        return serde_json::from_str(line.trim()).unwrap();
+    }
+    let mut length = 0usize;
+    loop {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            length = rest.trim().parse().unwrap();
+        }
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+    }
+    let mut buffer = vec![0u8; length];
+    reader.read_exact(&mut buffer).unwrap();
+    serde_json::from_slice(&buffer).unwrap()
+}
+
+#[test]
+fn mcp_lists_permission_tools_and_reports_status() {
+    let bin = env!("CARGO_BIN_EXE_ait");
+    let dir = temp_dir();
+    let init = Command::new(bin)
+        .args(["init", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    fs::write(dir.join("README.md"), "hello\n").unwrap();
+    for args in [vec!["add"], vec!["commit", "-m", "readme"]] {
+        let output = Command::new(bin)
+            .args(&args)
+            .current_dir(&dir)
+            .env("AIT_AUTHOR_NAME", "Tester")
+            .env("AIT_AUTHOR_EMAIL", "tester@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut call = |id: i64, method: &str, params: serde_json::Value| {
+        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+        read_message(&mut stdout)
+    };
+
+    let init = call(1, "initialize", json!({}));
+    assert_eq!(init["result"]["serverInfo"]["name"], "ait", "{init}");
+    let tools = call(2, "tools/list", json!({}));
+    let names = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    for required in [
+        "status",
+        "check_paths",
+        "commit",
+        "propose",
+        "permissions",
+        "owners",
+    ] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "缺少工具 {required}: {names:?}"
+        );
+    }
+    let status = call(3, "tools/call", json!({"name": "status", "arguments": {}}));
+    let text = status["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(text.contains("\"branch\": \"main\""), "{status}");
+    assert_eq!(status["result"]["isError"], false);
+    let log = call(
+        4,
+        "tools/call",
+        json!({"name": "log", "arguments": {"limit": 5}}),
+    );
+    let history = log["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(history.contains("readme"), "{log}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(dir);
+}
