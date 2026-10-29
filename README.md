@@ -8,6 +8,38 @@ Development in the AI era produces a lot of code quickly: one person may drive d
 
 The rules are still rough. Join the [Discussions](https://github.com/liubox123/ait/discussions) about whether permissions should stop at directories or reach symbols, whether review should be done by people or by models, and how agents should share one structure. Use Issues for concrete bugs.
 
+## Why ait
+
+### The pain of coding with AI
+
+- **Changes arrive faster than anyone can read them.** An agent edits dozens of files in minutes, while a person has to read every line before merging. Review becomes the bottleneck, and often only the test result gets checked.
+- **Edits leave their lane.** Asked to fix one endpoint, an agent renames a shared function, edits a config file, and bumps a dependency. A prompt that says “only touch this directory” is not always followed.
+- **Problems get quietly bypassed.** When tests fail, tests get deleted, skipped, or loosened. Debug output and conflict markers stay behind, and now and then a secret lands in the code.
+- **Context gets lost.** A new session or a different tool forgets earlier agreements. The same problem gets solved several different ways, and the structure drifts.
+- **History is hard to trace.** One commit mixes human and agent edits, and later nobody can say who asked for a line or why.
+- **Undoing is expensive.** Large generated changes are tangled together. Removing part of one means reverting all of it or picking pieces by hand.
+
+### The pain of collaborating with AI
+
+- **Several agents edit the same place.** Agents work in parallel without knowing what the others are changing. Conflicts show up only at merge time, or worse, the merge succeeds and the logic contradicts itself.
+- **Structures don't line up.** Each agent invents its own directories, names, and style, and the result reads like several projects stitched together.
+- **Ownership lives only in documents.** Who owns which area sits in docs or chat history. Agents can't see it and Git doesn't enforce it: anyone who can push can change any file.
+- **Permissions are too coarse.** Hosting platforms grant access per repository or branch, and can't say “this agent may only change `src/api/`”. A separate repository per agent splits the code apart.
+- **Review falls on a few people.** Agents produce far more than people can review, and it is unclear who should look at a change that crosses modules.
+- **Agent reports can't be trusted.** An agent says “tests pass”, and nobody can confirm it ran them, or which ones.
+- **Nobody knows which agent did it.** One person runs agents in the editor, on the command line, and in CI under a single account, and when something breaks nobody can tell which one did it.
+
+### What ait does
+
+- **Ownership becomes repository rules.** A project plan assigns directories and duties, and every person and agent receives the same permission manifest. Agents can ask over MCP what they may change before writing. Edits outside a duty don't land on the branch; they become a review or a merge request, decided by someone who can write those paths.
+- **Change size is limited.** A member can be limited in files and lines per change. Anything larger lands only after a second person approves it.
+- **A machine reads it first.** The AI reviewer flags boundary violations, oversized changes, likely secrets, conflict markers, deleted tests, and debug output, so people can focus on the judgment calls.
+- **Check results come from trusted sources.** Required checks count only results from the server sandbox, a repository owner, or a `ci` account. Agent reports are kept for reference.
+- **Intent is recorded before work starts.** People and agents record the paths they plan to change. Overlaps are shown to both sides; nothing is locked and nobody is blocked.
+- **Each agent has its own identity.** An agent is a separate member account with an optional supervisor, and commits, reviews, and activity are recorded under that account.
+
+ait does not solve lost context or hard-to-undo large changes. Those still depend on working habits and other tools.
+
 ## Features
 
 - **Everyday Git commands.** `init`, `add`, `status`, `diff`, `commit`, `log`, `branch`, `checkout`, `merge`, `push`, and `pull`. The object format matches Git, including packs produced by `git gc`.
