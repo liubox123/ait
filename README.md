@@ -16,7 +16,11 @@ The rules are still rough. Join the [Discussions](https://github.com/liubox123/a
 - **Review.** A direct push to `main` that leaves the author’s write set does not move the branch. It opens a review for someone who may write those paths to approve or reject.
 - **Merge requests.** Other branches can be pushed first, then opened with `ait pr create`. The author can merge changes inside their own duty. Paths outside that duty need approval from someone who can write them. A branch owned by someone else cannot be updated. Merging reports a conflict when the target branch has already changed the same file.
 - **MCP.** An agent runs `ait mcp` in the repository and can read duties and path permissions before writing. `commit` accepts only files inside the write set. Cross-directory edits use `propose`.
-- **Management page.** After `ait serve`, people can register, create repositories, browse code and commits, handle merge requests and reviews, edit path rules, and paste a plan.
+- **Members and limits.** Each member is a `human`, an `agent`, or a `ci` account. An agent can have a supervisor. Limits set the most files and lines per change, extra required checks, and whether every change needs a second person. A change over its limits still lands, after someone else approves it.
+- **Checks.** `.ait/checks.toml` declares checks. Results are reported over the API, or run by the server in a Docker sandbox. Required checks gate merges and push reviews. Only results from the server runner, an owner, or a `ci` account count. Agent reports are kept for reference.
+- **AI reviewer.** Built-in rules look for boundary violations, oversized changes, likely secrets, conflict markers, deleted tests, debug output, and overlap with someone else's work intent. With an OpenAI-compatible model configured for the repository, its opinion is added too. The reviewer only comments; a person with write access decides.
+- **Work intents.** People and agents record which paths they are about to change. Intents never lock; overlaps are shown to both sides and to the AI reviewer.
+- **Management page.** After `ait serve`, people can register, create repositories, browse code and commits, handle merge requests and reviews, edit path rules, and paste a plan. The fuller web front end is [ait-web](https://github.com/liubox123/ait-web), with pages adapted from GitLab, a directory × member planner, a collaboration board, and checks and AI review panels.
 - **Multi-platform releases.** A push to `main` tests and builds on Linux, macOS, and Windows. A `v*` tag publishes the binaries on GitHub Releases.
 
 ## Start
@@ -132,13 +136,69 @@ The Chinese headings `职责:` and `目录:` are accepted too, as is `@bob src/c
 {"assignments":[{"user":"bob","duty":"products and inventory","paths":["src/catalog/**"]}]}
 ```
 
-`ait plan apply --file examples/shop.plan.md --llm` sends the plan to an OpenAI-compatible API. The endpoint is configured on the server process. There is no per-repository model setting yet, and no model review:
+`ait plan apply --file examples/shop.plan.md --llm` sends the plan to an OpenAI-compatible API configured on the server process:
 
 - `AIT_LLM_BASE_URL`, for example `https://api.openai.com/v1`
 - `AIT_LLM_API_KEY`
 - `AIT_LLM_MODEL`, default `gpt-4o-mini`
 
 The HTTP call is `PUT /api/repos/:name/plan` with `{ "content", "apply", "use_llm" }`. Only a repository owner can change the plan.
+
+Members and limits live in the policy next to rules and duties:
+
+```json
+{
+  "rules": [{ "user": "bob", "pattern": "src/api/**", "access": "write" }],
+  "duties": [{ "user": "bob", "summary": "API agent", "paths": ["src/api/**"] }],
+  "members": [
+    { "user": "bob", "kind": "agent", "supervisor": "alice",
+      "limits": { "max_files": 10, "max_lines": 400, "required_checks": ["test"], "human_review": false } },
+    { "user": "ci-bot", "kind": "ci" }
+  ]
+}
+```
+
+`PUT /api/repos/:name/policy` saves it. `POST /api/repos/:name/policy/preview` takes the same body and returns, for every directory, who may write it, who is denied, and who holds the duty, plus each member's manifest, warnings, and errors, without saving.
+
+## Checks
+
+```toml
+# .ait/checks.toml
+[[check]]
+name = "test"
+run = "cargo test"
+image = "rust:1"
+required = true
+paths = ["src/**", "tests/**"]   # applies only when the change touches these paths
+runner = "any"                   # report, server, or any
+timeout = 600
+```
+
+- `GET /api/repos/:name/checks?reference=` lists declared checks, gates, and runs for a commit.
+- `POST /api/repos/:name/checks` reports `{ reference, name, status, summary, url, log }`. Status is `success`, `failure`, `error`, or `skipped`.
+- `POST /api/repos/:name/checks/run` runs server checks for `{ reference, name? }`.
+
+The server runner is off by default. `AIT_CHECK_RUNNER=docker` enables it. Each check runs in a container with no network, all capabilities dropped, `no-new-privileges`, and limits on processes, memory, and CPU. `AIT_CHECK_IMAGES` is a comma-separated image allowlist, `AIT_CHECK_IMAGE` the default image (`alpine:3`), and `AIT_DOCKER` the docker binary. When the runner is on, new merge requests and pushes start their server checks automatically.
+
+## AI reviewer
+
+`GET/PUT /api/repos/:name/ai` holds `{ enabled, auto, base_url, model, api_key, instructions }`. The key is write-only: reads return `has_api_key`. Without a repository model, the reviewer falls back to the `AIT_LLM_*` variables, and without those it runs the built-in rules alone. `POST /api/repos/:name/pulls/:id/ai-review` and `POST /api/repos/:name/reviews/:id/ai-review` request a review. With `auto` on, merge requests and push reviews are reviewed when they are created.
+
+## Collaboration
+
+- `GET/POST /api/repos/:name/claims` lists or records a work intent `{ paths, intent, branch?, ttl_minutes? }`. The answer lists overlapping intents.
+- `DELETE /api/repos/:name/claims/:id` finishes one.
+- `GET /api/repos/:name/events` returns recent pushes, reviews, merges, checks, AI reviews, and plan changes.
+
+## Web front end
+
+Build [ait-web](https://github.com/liubox123/ait-web) and point the server at it:
+
+```bash
+AIT_WEB_DIR=/path/to/ait-web/dist ait serve
+```
+
+The pages are served at `/ui/`.
 
 ## MCP
 
@@ -155,7 +215,7 @@ Run `ait mcp` in the repository. This repository's `.cursor/mcp.json` registers 
 }
 ```
 
-Tools: `status`, `diff`, `log`, `permissions`, `check_paths`, `commit`, `restore`, `propose`, `push`, `fetch`, `pull`, `branch`, `checkout`, `merge`, `pr`, `review`, `plan`, and `owners`. Call `check_paths` and `owners` before writing. When `commit` refuses a path outside the write set, `restore` takes it back out of the index. While a merge is in progress, `commit` checks only your own changes on top of the merged branch.
+Tools: `status`, `diff`, `log`, `permissions`, `check_paths`, `commit`, `restore`, `propose`, `push`, `fetch`, `pull`, `branch`, `checkout`, `merge`, `pr`, `review`, `plan`, `owners`, `claim`, `checks`, and `ai_review`. Record a work intent with `claim` before a larger change, report local test results with `checks`, and ask for a second opinion with `ai_review`. Call `check_paths` and `owners` before writing. When `commit` refuses a path outside the write set, `restore` takes it back out of the index. While a merge is in progress, `commit` checks only your own changes on top of the merged branch.
 
 ## Releases
 

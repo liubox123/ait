@@ -150,6 +150,7 @@ pub fn policy_from_assignments(owners: &[String], items: &[Assignment]) -> Polic
         owners: owners.to_vec(),
         rules,
         duties,
+        members: Vec::new(),
     }
 }
 

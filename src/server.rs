@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use crate::perm::{Duty, Rule};
+use crate::perm::{Duty, Member, Rule};
 use crate::store::{ApiError, AuthSession, PullRequest, PushRequest, Store};
 
 pub async fn serve(data: PathBuf, bind: &str) -> anyhow::Result<()> {
@@ -59,6 +59,21 @@ pub fn router(store: Store) -> Router {
         .route("/api/repos/:name/pulls/:id/approve", post(approve_pull))
         .route("/api/repos/:name/pulls/:id/merge", post(merge_pull))
         .route("/api/repos/:name/pulls/:id/close", post(close_pull))
+        .route("/api/repos/:name/pulls/:id/ai-review", post(ai_review_pull))
+        .route("/api/repos/:name/reviews/:id/ai-review", post(ai_review_push))
+        .route("/api/repos/:name/policy/preview", post(policy_preview))
+        .route("/api/repos/:name/ai", get(get_ai).put(put_ai))
+        .route("/api/repos/:name/ai-reviews", get(ai_reviews))
+        .route("/api/repos/:name/checks", get(checks).post(report_check))
+        .route("/api/repos/:name/checks/run", post(run_checks))
+        .route("/api/repos/:name/checks/:id", get(check_detail))
+        .route("/api/repos/:name/claims", get(claims).post(add_claim))
+        .route("/api/repos/:name/claims/:id", axum::routing::delete(release_claim))
+        .route("/api/repos/:name/events", get(events))
+        .route("/api/users", get(users))
+        .route("/ui", get(web_index))
+        .route("/ui/", get(web_index))
+        .route("/ui/*path", get(web_asset))
         .route("/api/git/:name/refs", get(git_refs))
         .route("/api/git/:name/pull", post(git_pull))
         .route("/api/git/:name/push", post(git_push))
@@ -258,6 +273,8 @@ async fn get_policy(
 struct PolicyBody {
     rules: Vec<Rule>,
     duties: Vec<Duty>,
+    #[serde(default)]
+    members: Option<Vec<Member>>,
 }
 
 async fn put_policy(
@@ -273,7 +290,308 @@ async fn put_policy(
         &name,
         body.rules,
         body.duties,
+        body.members,
     )?))
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    #[serde(default)]
+    reference: String,
+    rules: Vec<Rule>,
+    duties: Vec<Duty>,
+    #[serde(default)]
+    members: Vec<Member>,
+}
+
+async fn policy_preview(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<PreviewBody>,
+) -> Result<Json<crate::store::PolicyPreview>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    blocking(move || {
+        store.policy_preview(&name, &body.reference, body.rules, body.duties, body.members)
+    })
+    .await
+}
+
+async fn users(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.user_names()?))
+}
+
+async fn get_ai(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::collab::AiConfigView>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.ai_config(&name)?))
+}
+
+async fn put_ai(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<crate::store::AiConfigUpdate>,
+) -> Result<Json<crate::collab::AiConfigView>, ApiError> {
+    let session = auth(&store, &headers)?;
+    Ok(Json(store.put_ai_config(
+        &session.user,
+        session.admin,
+        &name,
+        body,
+    )?))
+}
+
+#[derive(Deserialize)]
+struct TargetQuery {
+    #[serde(default)]
+    target: String,
+}
+
+async fn ai_reviews(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(query): Query<TargetQuery>,
+) -> Result<Json<Vec<crate::collab::AiReview>>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.ai_reviews(&name, &query.target)?))
+}
+
+async fn ai_review_pull(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<crate::collab::AiReview>, ApiError> {
+    let session = auth(&store, &headers)?;
+    if !id.starts_with("pr-") {
+        return Err(ApiError::not_found("合并请求不存在"));
+    }
+    blocking(move || store.run_ai_review(&name, &session.user, &id)).await
+}
+
+async fn ai_review_push(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<crate::collab::AiReview>, ApiError> {
+    let session = auth(&store, &headers)?;
+    if !id.starts_with("r-") {
+        return Err(ApiError::not_found("评审不存在"));
+    }
+    blocking(move || store.run_ai_review(&name, &session.user, &id)).await
+}
+
+async fn checks(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<crate::store::ChecksView>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    blocking(move || store.checks_view(&name, &query.reference)).await
+}
+
+async fn check_detail(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<crate::collab::CheckRun>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.check_run(&name, &id)?))
+}
+
+async fn report_check(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<crate::store::CheckReport>,
+) -> Result<Json<crate::collab::CheckRun>, ApiError> {
+    let session = auth(&store, &headers)?;
+    blocking(move || store.report_check(&name, &session.user, session.admin, body)).await
+}
+
+#[derive(Deserialize)]
+struct RunChecksBody {
+    #[serde(default)]
+    reference: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn run_checks(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<RunChecksBody>,
+) -> Result<Json<Vec<crate::collab::CheckRun>>, ApiError> {
+    let session = auth(&store, &headers)?;
+    let queue = store.clone();
+    let repo = name.clone();
+    let jobs = blocking(move || {
+        queue.queue_server_checks(&repo, &session.user, &body.reference, body.name.as_deref())
+    })
+    .await?
+    .0;
+    let runs = jobs.iter().map(|(run, _)| run.clone()).collect();
+    std::thread::spawn(move || {
+        for (run, spec) in jobs {
+            store.execute_check(&name, &run, &spec);
+        }
+    });
+    Ok(Json(runs))
+}
+
+async fn claims(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<crate::collab::Claim>>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.claims(&name)?))
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    paths: Vec<String>,
+    intent: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    ttl_minutes: Option<i64>,
+}
+
+async fn add_claim(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<ClaimBody>,
+) -> Result<Json<crate::store::ClaimResult>, ApiError> {
+    let session = auth(&store, &headers)?;
+    Ok(Json(store.add_claim(
+        &name,
+        &session.user,
+        body.paths,
+        &body.intent,
+        body.branch,
+        body.ttl_minutes,
+    )?))
+}
+
+async fn release_claim(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let session = auth(&store, &headers)?;
+    store.release_claim(&name, &session.user, session.admin, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn events(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<Vec<crate::collab::Event>>, ApiError> {
+    let _session = auth(&store, &headers)?;
+    Ok(Json(store.events(&name, query.limit.unwrap_or(100))?))
+}
+
+async fn blocking<T, F>(task: F) -> Result<Json<T>, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|_| ApiError::bad("内部任务失败"))?
+        .map(Json)
+}
+
+/// 推送或创建合并请求后，按仓库配置自动运行 AI 审查和服务端校验。
+fn after_change(store: &Store, name: &str, user: &str, ai_target: Option<String>, oid: Option<String>) {
+    let store = store.clone();
+    let name = name.to_string();
+    let user = user.to_string();
+    std::thread::spawn(move || {
+        if let Some(target) = ai_target {
+            if store.ai_auto(&name) {
+                let _ = store.run_ai_review(&name, &user, &target);
+            }
+        }
+        if let (Some(oid), Some(_)) = (oid, crate::store::check_runner()) {
+            if let Ok(jobs) = store.queue_server_checks(&name, &user, &oid, None) {
+                for (run, spec) in jobs {
+                    store.execute_check(&name, &run, &spec);
+                }
+            }
+        }
+    });
+}
+
+async fn web_index() -> impl IntoResponse {
+    web_file("index.html").await
+}
+
+async fn web_asset(Path(path): Path<String>) -> impl IntoResponse {
+    web_file(&path).await
+}
+
+/// 提供 `AIT_WEB_DIR` 里构建好的 ait-web 前端；找不到的路径交给前端路由。
+async fn web_file(path: &str) -> axum::response::Response {
+    let Ok(root) = std::env::var("AIT_WEB_DIR") else {
+        return (StatusCode::NOT_FOUND, "没有配置 AIT_WEB_DIR").into_response();
+    };
+    let root = PathBuf::from(root);
+    let clean: Vec<&str> = path
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    let mut file = root.join(clean.join("/"));
+    let hashed = clean.first() == Some(&"assets");
+    if clean.is_empty() || !file.is_file() {
+        if hashed {
+            return (StatusCode::NOT_FOUND, "找不到文件").into_response();
+        }
+        file = root.join("index.html");
+    }
+    // 构建产物带内容哈希，可以长期缓存；入口页每次都要重新取。
+    let cache = if hashed {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    let content_type = match file.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    match tokio::fs::read(&file).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, cache),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "找不到页面").into_response(),
+    }
 }
 
 async fn manifest(
@@ -429,7 +747,7 @@ async fn create_pull(
     Json(body): Json<CreatePullBody>,
 ) -> Result<Json<crate::store::ProposalView>, ApiError> {
     let session = auth(&store, &headers)?;
-    Ok(Json(store.create_proposal(
+    let view = store.create_proposal(
         &name,
         &session.user,
         session.admin,
@@ -437,7 +755,15 @@ async fn create_pull(
         &body.body,
         &body.base,
         &body.head,
-    )?))
+    )?;
+    after_change(
+        &store,
+        &name,
+        &session.user,
+        Some(view.proposal.id.clone()),
+        None,
+    );
+    Ok(Json(view))
 }
 
 async fn approve_pull(
@@ -517,10 +843,22 @@ async fn git_push(
     let store2 = store.clone();
     let user = session.user.clone();
     let admin = session.admin;
-    let result = tokio::task::spawn_blocking(move || store2.push(&name, &user, admin, body))
+    let repo = name.clone();
+    let result = tokio::task::spawn_blocking(move || store2.push(&repo, &user, admin, body))
         .await
-        .map_err(|_| ApiError::bad("内部任务失败"))?;
-    Ok(Json(result?))
+        .map_err(|_| ApiError::bad("内部任务失败"))??;
+    let ai_target = match &result.review_id {
+        Some(id) => Some(id.clone()),
+        None => store.open_pull_for(&name, &result.reference),
+    };
+    after_change(
+        &store,
+        &name,
+        &session.user,
+        ai_target,
+        Some(result.oid.to_string()),
+    );
+    Ok(Json(result))
 }
 
 fn auth(store: &Store, headers: &HeaderMap) -> Result<AuthSession, ApiError> {

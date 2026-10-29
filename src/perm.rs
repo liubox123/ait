@@ -33,11 +33,50 @@ pub struct Duty {
     pub paths: Vec<String>,
 }
 
+/// 单次推送或合并请求的改动边界。超过边界的改动不会被拒绝，而是转给有权限的人评审。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Limits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<usize>,
+    /// 合并前必须通过的校验名，叠加在 `.ait/checks.toml` 的 required 之上。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checks: Vec<String>,
+    /// 即使在写权限内，改动也要另一位有权限的人通过。
+    #[serde(default)]
+    pub human_review: bool,
+}
+
+impl Limits {
+    pub fn is_empty(&self) -> bool {
+        self == &Limits::default()
+    }
+}
+
+/// 参与者身份：`human`、`agent` 或 `ci`。agent 需要一位负责人；ci 账号上报的校验结果才算数。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Member {
+    pub user: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<String>,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+fn default_kind() -> String {
+    "human".into()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     pub owners: Vec<String>,
     pub rules: Vec<Rule>,
     pub duties: Vec<Duty>,
+    #[serde(default)]
+    pub members: Vec<Member>,
 }
 
 impl Policy {
@@ -54,11 +93,28 @@ impl Policy {
                 summary: "仓库所有者".into(),
                 paths: vec!["**".into()],
             }],
+            members: Vec::new(),
         }
     }
 
     pub fn is_owner(&self, user: &str, admin: bool) -> bool {
         admin || self.owners.iter().any(|owner| owner == user)
+    }
+
+    pub fn member(&self, user: &str) -> Option<&Member> {
+        self.members.iter().find(|member| member.user == user)
+    }
+
+    pub fn kind_of(&self, user: &str) -> &str {
+        self.member(user)
+            .map(|member| member.kind.as_str())
+            .unwrap_or("human")
+    }
+
+    pub fn limits_of(&self, user: &str) -> Limits {
+        self.member(user)
+            .map(|member| member.limits.clone())
+            .unwrap_or_default()
     }
 
     pub fn manifest_for(&self, user: &str, admin: bool) -> Manifest {
@@ -69,6 +125,8 @@ impl Policy {
             .map(|item| item.summary.as_str())
             .collect::<Vec<_>>()
             .join("；");
+        let kind = self.kind_of(user).to_string();
+        let limits = self.limits_of(user);
         if self.is_owner(user, admin) {
             return Manifest {
                 user: user.to_string(),
@@ -79,6 +137,8 @@ impl Policy {
                 },
                 write: vec!["**".into()],
                 deny: Vec::new(),
+                kind,
+                limits,
             };
         }
         let write = self
@@ -102,6 +162,8 @@ impl Policy {
             },
             write,
             deny,
+            kind,
+            limits,
         }
     }
 }
@@ -117,6 +179,10 @@ pub struct Manifest {
     pub duty: String,
     pub write: Vec<String>,
     pub deny: Vec<String>,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Limits::is_empty")]
+    pub limits: Limits,
 }
 
 impl Manifest {
@@ -145,6 +211,22 @@ impl Manifest {
             for pattern in &self.deny {
                 out.push_str(&format!("  {pattern}\n"));
             }
+        }
+        let limits = &self.limits;
+        if let Some(max) = limits.max_files {
+            out.push_str(&format!("单次最多改动文件: {max}\n"));
+        }
+        if let Some(max) = limits.max_lines {
+            out.push_str(&format!("单次最多改动行数: {max}\n"));
+        }
+        if !limits.required_checks.is_empty() {
+            out.push_str(&format!(
+                "合并前必须通过: {}\n",
+                limits.required_checks.join(", ")
+            ));
+        }
+        if limits.human_review {
+            out.push_str("所有改动都需要另一位有权限的人通过。\n");
         }
         out.push_str("其他路径可以在本地修改，推送时需要有权限的人评审。\n");
         out
@@ -239,6 +321,7 @@ mod tests {
                 summary: "商品".into(),
                 paths: vec!["src/shop/**".into()],
             }],
+            members: Vec::new(),
         };
         let bob = policy.manifest_for("bob", false);
         assert_eq!(bob.decide("src/shop/item.rs"), Access::Write);

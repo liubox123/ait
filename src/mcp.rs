@@ -169,6 +169,21 @@ fn tool_specs() -> Vec<Value> {
             json!({"type":"object","properties":{"action":{"type":"string","enum":["list","approve","reject"]},"id":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}),
         ),
         tool(
+            "claim",
+            "登记或查看工作意图，让其他人和 agent 知道你要改哪些路径。开始较大改动前先 start，返回里会列出与别人重叠的意图；完成后 finish。action 为 list、start（paths、intent，可带 branch、ttl_minutes）、finish（id）。",
+            json!({"type":"object","properties":{"action":{"type":"string","enum":["list","start","finish"]},"paths":{"type":"array","items":{"type":"string"}},"intent":{"type":"string"},"branch":{"type":"string"},"ttl_minutes":{"type":"integer"},"id":{"type":"string"}},"required":["action"]}),
+        ),
+        tool(
+            "checks",
+            "查看或上报某个已推送提交的校验。status 列出 .ait/checks.toml 声明的校验和结果；report 上报结果（name、status 为 success/failure/error/running，可带 summary、log）；run 请求服务端在沙箱里执行。ref 默认是当前分支的提交。agent 自己上报的结果会记录，但不能满足必过校验。",
+            json!({"type":"object","properties":{"action":{"type":"string","enum":["status","report","run"]},"ref":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"summary":{"type":"string"},"log":{"type":"string"}},"required":["action"]}),
+        ),
+        tool(
+            "ai_review",
+            "请仓库的 AI 审查者审查一个合并请求（pr-…）或推送评审（r-…）。结论只是建议，最终由有权限的人决定。",
+            json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}),
+        ),
+        tool(
             "plan",
             "读取项目规划，以及每个人负责的目录。",
             json!({"type":"object","properties":{}}),
@@ -298,6 +313,21 @@ fn call_tool(repo: Option<&Repository>, params: &Value) -> anyhow::Result<String
                 }
                 other => anyhow::bail!("未知的评审操作 {other}"),
             }
+        }
+        "claim" => claim_tool(repo, &args),
+        "checks" => checks_tool(repo, &args),
+        "ai_review" => {
+            let id = string_arg(&args, "id")?;
+            let kind = if id.starts_with("pr-") {
+                "pulls"
+            } else if id.starts_with("r-") {
+                "reviews"
+            } else {
+                anyhow::bail!("id 应是 pr-… 或 r-…");
+            };
+            let review =
+                remote::repo_api(repo, "POST", &format!("/{kind}/{id}/ai-review"), Some(&json!({})))?;
+            Ok(serde_json::to_string_pretty(&review)?)
         }
         "plan" => {
             let text = remote::plan_text(repo).unwrap_or_default();
@@ -518,6 +548,81 @@ fn access_name(repo: &Repository, path: &str) -> &'static str {
         Access::Review => "review",
         Access::Deny => "deny",
     }
+}
+
+fn claim_tool(repo: &Repository, args: &Value) -> anyhow::Result<String> {
+    let action = string_arg(args, "action")?;
+    let value = match action.as_str() {
+        "list" => remote::repo_api(repo, "GET", "/claims", None)?,
+        "start" => {
+            let branch = args
+                .get("branch")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .or_else(|| repo.branch_name().ok().flatten());
+            remote::repo_api(
+                repo,
+                "POST",
+                "/claims",
+                Some(&json!({
+                    "paths": string_list(args, "paths")?,
+                    "intent": string_arg(args, "intent")?,
+                    "branch": branch,
+                    "ttl_minutes": args.get("ttl_minutes").and_then(|value| value.as_i64()),
+                })),
+            )?
+        }
+        "finish" => {
+            let id = string_arg(args, "id")?;
+            remote::repo_api(repo, "DELETE", &format!("/claims/{id}"), None)?;
+            return Ok(format!("已结束工作意图 {id}"));
+        }
+        other => anyhow::bail!("未知的操作 {other}"),
+    };
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn checks_tool(repo: &Repository, args: &Value) -> anyhow::Result<String> {
+    let action = string_arg(args, "action")?;
+    let reference = match args.get("ref").and_then(|value| value.as_str()) {
+        Some(reference) if !reference.trim().is_empty() => reference.trim().to_string(),
+        _ => repo
+            .head_oid()?
+            .map(|oid| oid.to_string())
+            .context("仓库还没有提交")?,
+    };
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let value = match action.as_str() {
+        "status" => remote::repo_api(repo, "GET", &format!("/checks?reference={reference}"), None)?,
+        "report" => remote::repo_api(
+            repo,
+            "POST",
+            "/checks",
+            Some(&json!({
+                "reference": reference,
+                "name": string_arg(args, "name")?,
+                "status": string_arg(args, "status")?,
+                "summary": text("summary"),
+                "log": text("log"),
+            })),
+        )?,
+        "run" => remote::repo_api(
+            repo,
+            "POST",
+            "/checks/run",
+            Some(&json!({
+                "reference": reference,
+                "name": args.get("name").and_then(|value| value.as_str()),
+            })),
+        )?,
+        other => anyhow::bail!("未知的操作 {other}"),
+    };
+    Ok(serde_json::to_string_pretty(&value)?)
 }
 
 fn string_list(args: &Value, key: &str) -> anyhow::Result<Vec<String>> {

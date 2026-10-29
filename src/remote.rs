@@ -381,6 +381,18 @@ pub fn create_proposal(
     )
 }
 
+/// 调用当前仓库的服务端接口，`path` 相对 `/api/repos/<仓库>`。
+pub fn repo_api(
+    repo: &Repository,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let client = Client::from_repo(repo)?;
+    let url = format!("{}/api/repos/{}{path}", client.origin, client.repo);
+    request_value(method, &url, Some(&client.token), body)
+}
+
 pub fn policy(repo: &Repository) -> anyhow::Result<crate::perm::Policy> {
     let client = Client::from_repo(repo)?;
     request_json(

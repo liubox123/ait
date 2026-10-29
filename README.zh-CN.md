@@ -16,7 +16,11 @@ AI 时代的开发和过去不一样：同一个人会在不同环境里驱动�
 - **评审。** 直接推到 `main` 时，越权修改不会移动分支，而是生成一条评审，由对该路径有写权限的人通过或拒绝。
 - **合并请求。** 其他分支可以先推上去，再用 `ait pr create` 请求合并。职责内的改动作者可以自己合并；越权路径要先由有写权限的人通过。不能推送到别人的分支。目标分支已经改过同一文件时，合并会报冲突。
 - **MCP。** agent 在仓库目录运行 `ait mcp`，写之前可以查询职责和路径权限。`commit` 只接受写权限内的文件，跨目录修改用 `propose`。
-- **管理页面。** `ait serve` 后可以注册、建仓库、浏览代码和提交、处理合并请求与评审、编辑路径规则、粘贴规划。
+- **成员与限制。** 每个成员是 `human`（开发者）、`agent` 或 `ci` 账号，agent 可以指定监督人。限制包括单次最多改动文件数和行数、额外的必过校验、是否所有改动都要另一个人通过。超出限制的改动照样可以提交，由别人通过后落地。
+- **校验。** 在 `.ait/checks.toml` 里声明校验，结果可以通过接口上报，也可以由服务端在 Docker 沙箱里执行。必过校验会拦住合并和推送评审。只有服务端执行器、仓库所有者和 `ci` 账号给出的结果才算数，agent 的上报留作参考。
+- **AI 审查者。** 内置规则会检查越权、改动过大、疑似密钥、冲突标记、删除测试、调试输出，以及和别人的工作意图重叠。仓库配置了 OpenAI 兼容模型时，再附上模型意见。审查者只给意见，由有写权限的人决定。
+- **工作意图。** 人和 agent 开工前登记要改的路径。登记不加锁，范围重叠时提示双方，AI 审查者也会提到。
+- **管理页面。** `ait serve` 后可以注册、建仓库、浏览代码和提交、处理合并请求与评审、编辑路径规则、粘贴规划。更完整的前端是 [ait-web](https://github.com/liubox123/ait-web)：页面改写自 GitLab，带目录 × 成员的规划页、协作看板，以及校验和 AI 审查面板。
 - **多系统发布。** 推送到 `main` 会在 Linux、macOS、Windows 上测试并编译。推送 `v*` 标签时，把各平台可执行文件发布到 GitHub Release。
 
 ## 开始
@@ -132,13 +136,69 @@ git push origin --delete old-branch
 {"assignments":[{"user":"bob","duty":"商品与库存","paths":["src/catalog/**"]}]}
 ```
 
-`ait plan apply --file examples/shop.plan.md --llm` 会把规划交给 OpenAI 兼容接口。这是服务进程的环境变量，还没有按仓库保存模型配置的接口，也还没有模型审阅：
+`ait plan apply --file examples/shop.plan.md --llm` 会把规划交给服务进程环境变量里配置的 OpenAI 兼容接口：
 
 - `AIT_LLM_BASE_URL`，例如 `https://api.openai.com/v1`
 - `AIT_LLM_API_KEY`
 - `AIT_LLM_MODEL`，默认 `gpt-4o-mini`
 
 对应的 HTTP 接口是 `PUT /api/repos/:name/plan`，正文为 `{ "content", "apply", "use_llm" }`。只有仓库所有者可以修改规划。
+
+成员与限制和规则、职责放在同一份权限策略里：
+
+```json
+{
+  "rules": [{ "user": "bob", "pattern": "src/api/**", "access": "write" }],
+  "duties": [{ "user": "bob", "summary": "后端接口 agent", "paths": ["src/api/**"] }],
+  "members": [
+    { "user": "bob", "kind": "agent", "supervisor": "alice",
+      "limits": { "max_files": 10, "max_lines": 400, "required_checks": ["test"], "human_review": false } },
+    { "user": "ci-bot", "kind": "ci" }
+  ]
+}
+```
+
+`PUT /api/repos/:name/policy` 保存。`POST /api/repos/:name/policy/preview` 接受同样的正文，不保存，返回每个目录谁能写、谁被禁止、谁负责，以及每个成员的权限清单、提示和错误。
+
+## 校验
+
+```toml
+# .ait/checks.toml
+[[check]]
+name = "test"
+run = "cargo test"
+image = "rust:1"
+required = true
+paths = ["src/**", "tests/**"]   # 只在改动命中这些路径时适用
+runner = "any"                   # report、server 或 any
+timeout = 600
+```
+
+- `GET /api/repos/:name/checks?reference=` 返回某个提交声明的校验、门禁和执行记录。
+- `POST /api/repos/:name/checks` 上报 `{ reference, name, status, summary, url, log }`，状态为 `success`、`failure`、`error` 或 `skipped`。
+- `POST /api/repos/:name/checks/run` 按 `{ reference, name? }` 在服务端执行。
+
+服务端执行器默认关闭，设置 `AIT_CHECK_RUNNER=docker` 后启用。每项校验在无网络、去掉全部 capability、`no-new-privileges`、限制进程数、内存和 CPU 的容器里运行。`AIT_CHECK_IMAGES` 是逗号分隔的镜像白名单，`AIT_CHECK_IMAGE` 是默认镜像（`alpine:3`），`AIT_DOCKER` 指定 docker 命令。执行器开启时，新的合并请求和推送会自动开始服务端校验。
+
+## AI 审查者
+
+`GET/PUT /api/repos/:name/ai` 保存 `{ enabled, auto, base_url, model, api_key, instructions }`。密钥只写不读，读取时只返回 `has_api_key`。仓库没有配置模型时退回 `AIT_LLM_*` 环境变量，再没有就只运行内置规则。`POST /api/repos/:name/pulls/:id/ai-review` 和 `POST /api/repos/:name/reviews/:id/ai-review` 发起审查；开启 `auto` 后，合并请求和推送评审创建时自动审查。
+
+## 协作
+
+- `GET/POST /api/repos/:name/claims` 查看或登记工作意图 `{ paths, intent, branch?, ttl_minutes? }`，返回结果里列出重叠的意图。
+- `DELETE /api/repos/:name/claims/:id` 结束一条意图。
+- `GET /api/repos/:name/events` 返回最近的推送、评审、合并、校验、AI 审查和规划变更。
+
+## Web 前端
+
+构建 [ait-web](https://github.com/liubox123/ait-web) 后交给服务端：
+
+```bash
+AIT_WEB_DIR=/path/to/ait-web/dist ait serve
+```
+
+页面在 `/ui/` 下。
 
 ## MCP
 
@@ -155,7 +215,7 @@ git push origin --delete old-branch
 }
 ```
 
-工具：`status`、`diff`、`log`、`permissions`、`check_paths`、`commit`、`restore`、`propose`、`push`、`fetch`、`pull`、`branch`、`checkout`、`merge`、`pr`、`review`、`plan`、`owners`。写代码前先调用 `check_paths` 和 `owners`。`commit` 拒绝越权文件后，用 `restore` 把它撤出暂存区。合并进行中时，`commit` 只检查本人在对方分支之上的改动。
+工具：`status`、`diff`、`log`、`permissions`、`check_paths`、`commit`、`restore`、`propose`、`push`、`fetch`、`pull`、`branch`、`checkout`、`merge`、`pr`、`review`、`plan`、`owners`、`claim`、`checks`、`ai_review`。写代码前先调用 `check_paths` 和 `owners`；较大的改动先用 `claim` 登记意图，用 `checks` 上报本地测试结果，用 `ai_review` 请 AI 审查者看一遍。`commit` 拒绝越权文件后，用 `restore` 把它撤出暂存区。合并进行中时，`commit` 只检查本人在对方分支之上的改动。
 
 ## 发布
 

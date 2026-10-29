@@ -4,6 +4,7 @@
 //! 多人与多个 agent 的写权限、评审和职责规划由 ait 服务端执行。
 
 pub mod cli;
+pub mod collab;
 pub mod git;
 pub mod identity;
 pub mod mcp;
