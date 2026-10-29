@@ -324,6 +324,72 @@ fn local_history_rewrite_matches_git() {
 }
 
 #[test]
+fn checkout_carries_local_changes_like_git() {
+    if !has_git() {
+        return;
+    }
+    let root = temp_dir();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    must(&home, &root, &["init", "mine"]);
+    git_ok(&root, &["init", "-q", "-b", "main", "theirs"]);
+    let repos = [root.join("mine"), root.join("theirs")];
+    let write = |path: &str, text: &str| {
+        for repo in &repos {
+            fs::write(repo.join(path), text).unwrap();
+        }
+    };
+    let both = |args: &[&str]| -> (bool, bool, String) {
+        let (mine, text) = ait(&home, &repos[0], args);
+        let (theirs, _) = git(&repos[1], args);
+        (mine, theirs, text)
+    };
+    let same = |args: &[&str], expect: bool| -> String {
+        let (mine, theirs, text) = both(args);
+        assert_eq!((mine, theirs), (expect, expect), "{args:?}:\n{text}");
+        let status: Vec<String> = repos
+            .iter()
+            .map(|repo| git_ok(repo, &["status", "--porcelain"]))
+            .collect();
+        assert_eq!(status[0], status[1], "{args:?} 之后状态与 git 不一致");
+        text
+    };
+
+    write("a.txt", "a\n");
+    write("b.txt", "b\n");
+    same(&["add", "a.txt", "b.txt"], true);
+    same(&["commit", "-q", "-m", "one"], true);
+    same(&["switch", "-c", "other"], true);
+    write("b.txt", "b2\n");
+    write("n.txt", "n\n");
+    same(&["add", "b.txt", "n.txt"], true);
+    same(&["commit", "-q", "-m", "two"], true);
+    same(&["switch", "main"], true);
+
+    write("a.txt", "a local\n");
+    write("s.txt", "staged\n");
+    same(&["add", "s.txt"], true);
+    same(&["switch", "other"], true);
+    for repo in &repos {
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a local\n");
+        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b2\n");
+    }
+    same(&["checkout", "--detach", "main"], true);
+    same(&["switch", "other"], true);
+
+    write("b.txt", "b local\n");
+    let refused = same(&["switch", "main"], false);
+    assert!(refused.contains("本地修改"), "{refused}");
+    same(&["checkout", "--", "b.txt"], true);
+
+    same(&["switch", "main"], true);
+    write("n.txt", "untracked\n");
+    let refused = same(&["switch", "other"], false);
+    assert!(refused.contains("未跟踪"), "{refused}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn remotes_tags_and_smart_http_interoperate_with_git() {
     if !has_git() {
         return;

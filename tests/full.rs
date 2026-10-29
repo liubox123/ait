@@ -229,7 +229,7 @@ fn local_branch_merge_conflict_and_dirty_tree() {
 
     fs::write(repo.join("note.txt"), "dirty\n").unwrap();
     let dirty = must_fail(bin, &home, &repo, &["switch", "feature"]);
-    assert!(dirty.contains("未提交"), "{dirty}");
+    assert!(dirty.contains("本地修改"), "{dirty}");
     fs::write(repo.join("note.txt"), "both\n").unwrap();
 
     let current = must_fail(bin, &home, &repo, &["branch", "-d", "main"]);

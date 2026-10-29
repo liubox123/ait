@@ -1045,7 +1045,7 @@ impl Repository {
             if self.resolve_ref(&format!("refs/heads/{target}"))?.is_some() {
                 bail!("分支已存在: {target}");
             }
-            self.switch_to(oid)?;
+            self.switch_carrying(oid)?;
             self.set_ref_logged(
                 &format!("refs/heads/{target}"),
                 oid,
@@ -1066,7 +1066,7 @@ impl Repository {
         let branch_ref = format!("refs/heads/{target}");
         if valid_branch(target) {
             if let Some(oid) = self.resolve_ref(&branch_ref)? {
-                self.switch_to(oid)?;
+                self.switch_carrying(oid)?;
                 self.set_head_symbolic(&branch_ref)?;
                 self.append_reflog(
                     "HEAD",
@@ -1081,7 +1081,7 @@ impl Repository {
             }
         }
         let oid = self.rev_parse(target)?;
-        self.switch_to(oid)?;
+        self.switch_carrying(oid)?;
         self.set_head_detached(oid)?;
         self.append_reflog(
             "HEAD",
@@ -1680,6 +1680,80 @@ impl Repository {
             }
         }
         self.checkout_files(&files)
+    }
+
+    /// 与 `git checkout` 相同：本地修改随之保留，只有落在两次提交之间有变化的路径上才拒绝。
+    fn switch_carrying(&self, oid: Oid) -> anyhow::Result<()> {
+        if self.head_oid()? == Some(oid) {
+            return Ok(());
+        }
+        let target = self.tree_files(self.read_commit(oid)?.tree)?;
+        let head = self.head_files().unwrap_or_default();
+        let status = self.status()?;
+        if status.staged.iter().any(|entry| entry.kind == ChangeKind::Unmerged) {
+            bail!("有未解决的冲突，请先解决或中止");
+        }
+        let mut index = self.read_index()?;
+        let unstaged: BTreeSet<&str> = status.unstaged.iter().map(|e| e.path.as_str()).collect();
+        let staged: BTreeSet<&str> = status.staged.iter().map(|e| e.path.as_str()).collect();
+        let changed: BTreeSet<&String> = head
+            .keys()
+            .chain(target.keys())
+            .filter(|path| head.get(*path) != target.get(*path))
+            .collect();
+        let mut blocked = Vec::new();
+        let mut untracked = Vec::new();
+        for path in &changed {
+            let path = path.as_str();
+            let entry = index.get(path).map(|entry| (entry.mode, entry.oid));
+            let already = entry == target.get(path).copied() && !unstaged.contains(path);
+            if (staged.contains(path) || unstaged.contains(path)) && !already {
+                blocked.push(path);
+            } else if !head.contains_key(path) && status.untracked.iter().any(|p| p == path) {
+                untracked.push(path);
+            }
+        }
+        if !blocked.is_empty() {
+            bail!(
+                "您对下列文件的本地修改将被检出操作覆盖：\n\t{}\n请在切换分支前提交或贮藏您的修改。",
+                blocked.join("\n\t")
+            );
+        }
+        if !untracked.is_empty() {
+            bail!(
+                "工作区中下列未跟踪的文件将会因为检出操作而被覆盖：\n\t{}\n请在切换分支前移动或删除。",
+                untracked.join("\n\t")
+            );
+        }
+        for path in changed.iter().filter(|path| !target.contains_key(path.as_str())) {
+            let disk = self.work_path(path)?;
+            if fs::symlink_metadata(&disk).is_ok() {
+                let _ = fs::remove_file(&disk);
+            }
+            index.remove(path);
+        }
+        for path in changed {
+            let Some((mode, oid)) = target.get(path.as_str()).copied() else {
+                continue;
+            };
+            if index.get(path).map(|entry| (entry.mode, entry.oid)) == Some((mode, oid))
+                && !unstaged.contains(path.as_str())
+            {
+                continue;
+            }
+            self.materialize(path, mode, oid)?;
+            let stat = index::stat_path(&self.work_path(path)?)
+                .map(|(_, stat)| stat)
+                .unwrap_or_default();
+            index.upsert(IndexEntry {
+                path: path.clone(),
+                mode,
+                oid,
+                stat,
+                stage: 0,
+            });
+        }
+        self.write_index_file(&index)
     }
 
     fn require_clean(&self) -> anyhow::Result<()> {
