@@ -47,6 +47,11 @@ pub fn load_identity() -> (String, String) {
     ) {
         return (name, email);
     }
+    saved_identity()
+}
+
+/// 只读 `identity.toml`，不受 `AIT_AUTHOR_*` / `GIT_AUTHOR_*` 影响，供 `ait config` 改其中一项时保留另一项。
+pub fn saved_identity() -> (String, String) {
     let path = ait_home().join("identity.toml");
     if let Ok(text) = fs::read_to_string(path) {
         if let Ok(file) = toml::from_str::<IdentityFile>(&text) {

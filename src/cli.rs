@@ -34,6 +34,10 @@ pub fn execute() -> anyhow::Result<()> {
             repo.add(&paths)?;
             println!("已更新索引");
         }
+        Command::Restore { paths, worktree } => {
+            let restored = open_repo()?.restore(&paths, worktree)?;
+            println!("已还原 {}", restored.join(", "));
+        }
         Command::Status => print_status(&open_repo()?)?,
         Command::Diff { cached } => {
             let repo = open_repo()?;
@@ -245,12 +249,12 @@ pub fn execute() -> anyhow::Result<()> {
         },
         Command::Config { key, value } => match key.as_str() {
             "user.name" => {
-                let (_, email) = identity::load_identity();
+                let (_, email) = identity::saved_identity();
                 identity::save_identity(&value, &email)?;
                 println!("user.name = {value}");
             }
             "user.email" => {
-                let (name, _) = identity::load_identity();
+                let (name, _) = identity::saved_identity();
                 identity::save_identity(&name, &value)?;
                 println!("user.email = {value}");
             }
@@ -497,6 +501,13 @@ enum Command {
     Add {
         #[arg(num_args = 0..)]
         paths: Vec<String>,
+    },
+    /// 把路径从暂存区撤回到 HEAD 的版本；加 --worktree 时连工作区一起还原
+    Restore {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        worktree: bool,
     },
     /// 查看工作区状态和越权文件
     Status,

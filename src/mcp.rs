@@ -129,6 +129,11 @@ fn tool_specs() -> Vec<Value> {
             json!({"type":"object","properties":{"force":{"type":"boolean"}}}),
         ),
         tool(
+            "restore",
+            "把路径从暂存区撤回到 HEAD 的版本。commit 因越权失败后，用它把越权文件撤出。worktree 为 true 时连工作区的改动一起丢弃。",
+            json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}},"worktree":{"type":"boolean"}},"required":["paths"]}),
+        ),
+        tool(
             "fetch",
             "获取远端所有分支到 origin/<分支>，并刷新修改权限清单。",
             json!({"type":"object","properties":{}}),
@@ -157,6 +162,11 @@ fn tool_specs() -> Vec<Value> {
             "pr",
             "合并请求。action 为 list、create（需要 title，可选 base，默认 main，来源是当前分支）、approve、merge、close（需要 id）。",
             json!({"type":"object","properties":{"action":{"type":"string","enum":["list","create","approve","merge","close"]},"id":{"type":"string"},"title":{"type":"string"},"base":{"type":"string"}},"required":["action"]}),
+        ),
+        tool(
+            "review",
+            "直接推到 main 的越权改动会生成评审。action 为 list、approve、reject（需要 id；reject 可带 reason）。",
+            json!({"type":"object","properties":{"action":{"type":"string","enum":["list","approve","reject"]},"id":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}),
         ),
         tool(
             "plan",
@@ -240,6 +250,16 @@ fn call_tool(repo: Option<&Repository>, params: &Value) -> anyhow::Result<String
             let response = remote::push_repo(repo, force)?;
             Ok(format!("{}\n{}", response.message, response.manifest.render()))
         }
+        "restore" => {
+            let paths = string_list(&args, "paths")?;
+            let worktree = bool_arg(&args, "worktree");
+            let restored = repo.restore(&paths, worktree)?;
+            Ok(format!(
+                "已{}还原: {}",
+                if worktree { "连同工作区" } else { "从暂存区" },
+                restored.join(", ")
+            ))
+        }
         "fetch" => {
             let client = remote::Client::from_repo(repo)?;
             let manifest = remote::fetch_repo(repo, &client)?;
@@ -257,6 +277,28 @@ fn call_tool(repo: Option<&Repository>, params: &Value) -> anyhow::Result<String
         }
         "merge" => merge_tool(repo, &args),
         "pr" => pr_tool(repo, &args),
+        "review" => {
+            let action = string_arg(&args, "action")?;
+            match action.as_str() {
+                "list" => Ok(serde_json::to_string_pretty(&remote::reviews(repo)?)?),
+                "approve" => Ok(serde_json::to_string_pretty(&remote::approve(
+                    repo,
+                    &string_arg(&args, "id")?,
+                )?)?),
+                "reject" => {
+                    let reason = args
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    Ok(serde_json::to_string_pretty(&remote::reject(
+                        repo,
+                        &string_arg(&args, "id")?,
+                        reason,
+                    )?)?)
+                }
+                other => anyhow::bail!("未知的评审操作 {other}"),
+            }
+        }
         "plan" => {
             let text = remote::plan_text(repo).unwrap_or_default();
             let policy = remote::policy(repo)?;
@@ -325,12 +367,31 @@ fn commit_tool(repo: &Repository, args: &Value, propose: bool) -> anyhow::Result
     if committing.is_empty() {
         anyhow::bail!("没有需要提交的内容");
     }
+    let checked: Vec<String> = match repo.merge_head()? {
+        Some(merging) => {
+            let own: std::collections::BTreeSet<String> =
+                repo.staged_changes_against(merging)?.into_iter().collect();
+            let unstaged: std::collections::BTreeSet<&str> = status
+                .unstaged
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect();
+            committing
+                .iter()
+                .filter(|path| {
+                    own.contains(*path) || (take_unstaged && unstaged.contains(path.as_str()))
+                })
+                .cloned()
+                .collect()
+        }
+        None => committing.clone(),
+    };
     let mut reviews = Vec::new();
-    for path in &committing {
+    for path in &checked {
         match decide(repo, path) {
             Access::Deny => anyhow::bail!("{path} 被禁止修改"),
             Access::Review if !propose => {
-                anyhow::bail!("{path} 不在你的写权限内。请不要把它留在这次提交里；如果确实要改，改用 propose，推送后会进入人工评审")
+                anyhow::bail!("{path} 不在你的写权限内。用 restore 把它撤出暂存区再提交；如果确实要改，改用 propose，推送后会进入人工评审")
             }
             Access::Review => reviews.push(path.clone()),
             Access::Write => {}

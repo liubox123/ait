@@ -829,6 +829,66 @@ impl Repository {
         self.forget_conflicts(&specs)
     }
 
+    /// 把路径在暂存区里还原成 HEAD 的版本；`worktree` 为 true 时工作区文件也一并还原，HEAD 里没有的文件会被删掉。
+    pub fn restore(&self, specs: &[String], worktree: bool) -> anyhow::Result<Vec<String>> {
+        self.work_tree_required()?;
+        if specs.is_empty() {
+            bail!("请指定要还原的路径");
+        }
+        let head = self.head_files()?;
+        let mut index = self.read_index()?;
+        let mut targets = BTreeSet::new();
+        for spec in specs {
+            let rel = self.resolve_spec(spec)?;
+            let covers =
+                |path: &str| rel.is_empty() || path == rel || path.starts_with(&format!("{rel}/"));
+            targets.extend(head.keys().filter(|path| covers(path)).cloned());
+            targets.extend(
+                index
+                    .entries
+                    .iter()
+                    .filter(|entry| covers(&entry.path))
+                    .map(|entry| entry.path.clone()),
+            );
+            if worktree && !rel.is_empty() && self.work_path(&rel)?.is_file() {
+                targets.insert(rel.clone());
+            }
+        }
+        if targets.is_empty() {
+            bail!("这些路径没有可还原的内容: {}", specs.join(", "));
+        }
+        for path in &targets {
+            index.remove(path);
+            match head.get(path) {
+                Some((mode, oid)) => {
+                    let stat = if worktree {
+                        self.materialize(path, *mode, *oid)?;
+                        index::stat_path(&self.work_path(path)?)?.1
+                    } else {
+                        FileStat::default()
+                    };
+                    index.upsert(IndexEntry {
+                        path: path.clone(),
+                        mode: *mode,
+                        oid: *oid,
+                        stat,
+                        stage: 0,
+                    });
+                }
+                None if worktree => {
+                    let disk = self.work_path(path)?;
+                    if fs::symlink_metadata(&disk).is_ok() {
+                        fs::remove_file(&disk)?;
+                    }
+                }
+                None => {}
+            }
+        }
+        self.write_index_file(&index)?;
+        self.forget_conflicts(specs)?;
+        Ok(targets.into_iter().collect())
+    }
+
     pub fn commit(&self, message: &str, all: bool, author: &Signature) -> anyhow::Result<Oid> {
         let message = message.trim();
         if message.is_empty() {
@@ -1761,7 +1821,17 @@ impl Repository {
         Ok(path)
     }
 
-    fn merge_head(&self) -> anyhow::Result<Option<Oid>> {
+    /// 暂存区相对某个提交改了哪些路径。合并进行中时，用 MERGE_HEAD 求出的就是本人在对方之上的改动。
+    pub fn staged_changes_against(&self, oid: Oid) -> anyhow::Result<Vec<String>> {
+        let base = self.files_of_commit(Some(oid))?;
+        let staged = index_map(&self.read_index()?);
+        Ok(path_changes(&base, &staged)
+            .into_iter()
+            .map(|change| change.path)
+            .collect())
+    }
+
+    pub fn merge_head(&self) -> anyhow::Result<Option<Oid>> {
         for name in ["MERGE_HEAD", "ait/MERGE_HEAD"] {
             let path = self.git_dir.join(name);
             if path.is_file() {

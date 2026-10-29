@@ -56,6 +56,7 @@ docker compose up -d --build
 ```bash
 ait init
 ait add
+ait restore src/lib.rs --worktree
 ait status
 ait diff
 ait commit -m "说明"
@@ -119,7 +120,7 @@ ait pr close pr-1a2b3c4d
 }
 ```
 
-工具：`status`、`diff`、`log`、`permissions`、`check_paths`、`commit`、`propose`、`push`、`plan`、`owners`。写代码前先调用 `check_paths` 和 `owners`。
+工具：`status`、`diff`、`log`、`permissions`、`check_paths`、`commit`、`restore`、`propose`、`push`、`fetch`、`pull`、`branch`、`checkout`、`merge`、`pr`、`review`、`plan`、`owners`。写代码前先调用 `check_paths` 和 `owners`。`commit` 拒绝越权文件后，用 `restore` 把它撤出暂存区。合并进行中时，`commit` 只检查本人在对方分支之上的改动。
 
 ## 发布
 

@@ -107,6 +107,8 @@ fn mcp_lists_permission_tools_and_reports_status() {
         "branch",
         "checkout",
         "pr",
+        "review",
+        "restore",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -161,6 +163,36 @@ fn mcp_lists_permission_tools_and_reports_status() {
     assert_eq!(fs::read_to_string(dir.join("side.txt")).unwrap(), "side\n");
     let branches = call(9, "tools/call", json!({"name": "branch", "arguments": {}}));
     assert!(text_of(&branches).contains("\"side\""), "{branches}");
+
+    fs::write(dir.join("README.md"), "changed\n").unwrap();
+    fs::write(dir.join("extra.txt"), "extra\n").unwrap();
+    let staged = Command::new(bin)
+        .args(["add", "README.md", "extra.txt"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    let unstaged = call(
+        10,
+        "tools/call",
+        json!({"name": "restore", "arguments": {"paths": ["extra.txt"]}}),
+    );
+    assert_eq!(unstaged["result"]["isError"], false, "{unstaged}");
+    assert!(dir.join("extra.txt").exists());
+    let reverted = call(
+        11,
+        "tools/call",
+        json!({"name": "restore", "arguments": {"paths": ["README.md"], "worktree": true}}),
+    );
+    assert_eq!(reverted["result"]["isError"], false, "{reverted}");
+    assert_eq!(
+        fs::read_to_string(dir.join("README.md")).unwrap(),
+        "hello\n"
+    );
+    let after = call(12, "tools/call", json!({"name": "status", "arguments": {}}));
+    let after_text = text_of(&after);
+    assert!(after_text.contains("\"staged\": []"), "{after}");
+    assert!(after_text.contains("extra.txt"), "{after}");
 
     let _ = child.kill();
     let _ = child.wait();

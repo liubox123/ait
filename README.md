@@ -56,6 +56,7 @@ The page listens on `http://127.0.0.1:7878`. Repository data stays in the `ait-d
 ```bash
 ait init
 ait add
+ait restore src/lib.rs --worktree
 ait status
 ait diff
 ait commit -m "message"
@@ -119,7 +120,7 @@ Run `ait mcp` in the repository. This repository's `.cursor/mcp.json` registers 
 }
 ```
 
-Tools: `status`, `diff`, `log`, `permissions`, `check_paths`, `commit`, `propose`, `push`, `plan`, and `owners`. Call `check_paths` and `owners` before writing.
+Tools: `status`, `diff`, `log`, `permissions`, `check_paths`, `commit`, `restore`, `propose`, `push`, `fetch`, `pull`, `branch`, `checkout`, `merge`, `pr`, `review`, `plan`, and `owners`. Call `check_paths` and `owners` before writing. When `commit` refuses a path outside the write set, `restore` takes it back out of the index. While a merge is in progress, `commit` checks only your own changes on top of the merged branch.
 
 ## Releases
 

@@ -562,7 +562,80 @@ fn permissions_reviews_force_api_and_mcp() {
         "alice readme\n"
     );
 
+    fs::write(shop.join("README.md"), "alice readme v2\n").unwrap();
+    fs::write(shop.join("src/catalog/item.rs"), "item alice\n").unwrap();
+    must(bin, &alice, &shop, &["commit", "-a", "-m", "两处都改"]);
+    must(bin, &alice, &shop, &["push"]);
+    fs::write(bob_shop.join("src/catalog/item.rs"), "item bob\n").unwrap();
+    must(bin, &bob, &bob_shop, &["commit", "-a", "-m", "商品四"]);
+    mcp_merge_keeps_incoming_paths(bin, &bob, &bob_shop);
+    must(bin, &alice, &shop, &["pull"]);
+    assert_eq!(
+        fs::read_to_string(shop.join("src/catalog/item.rs")).unwrap(),
+        "item merged\n"
+    );
+    assert_eq!(
+        fs::read_to_string(shop.join("README.md")).unwrap(),
+        "alice readme v2\n"
+    );
+
     let _ = fs::remove_dir_all(root);
+}
+
+fn mcp_merge_keeps_incoming_paths(bin: &str, home: &Path, dir: &Path) {
+    let mut child = Command::new(bin)
+        .args(["mcp", "--repo", dir.to_str().unwrap()])
+        .current_dir(std::env::temp_dir())
+        .env("AIT_HOME", home)
+        .env("AIT_AUTHOR_NAME", "Tester")
+        .env("AIT_AUTHOR_EMAIL", "tester@example.com")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut call = |id: i64, name: &str, arguments: Value| {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        });
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+        read_mcp(&mut stdout)
+    };
+    let text = |value: &Value| {
+        value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let rejected = call(1, "push", json!({}));
+    assert!(text(&rejected).contains("不是快进"), "{rejected}");
+    let pulled = call(2, "pull", json!({}));
+    assert_eq!(pulled["result"]["isError"], true, "{pulled}");
+    assert!(text(&pulled).contains("src/catalog/item.rs"), "{pulled}");
+    let readme = call(3, "check_paths", json!({"paths": ["README.md"]}));
+    assert!(text(&readme).contains("review"), "{readme}");
+
+    fs::write(dir.join("src/catalog/item.rs"), "item merged\n").unwrap();
+    let committed = call(
+        4,
+        "commit",
+        json!({"message": "合并 origin/main", "paths": ["src/catalog/item.rs"]}),
+    );
+    assert_eq!(committed["result"]["isError"], false, "{committed}");
+    let pushed = call(5, "push", json!({}));
+    assert!(text(&pushed).contains("已更新"), "{pushed}");
+    let reviews = call(6, "review", json!({"action": "list"}));
+    assert_eq!(reviews["result"]["isError"], false, "{reviews}");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn mcp_commit_and_propose(bin: &str, home: &Path, dir: &Path) {
