@@ -1,6 +1,6 @@
 # ait
 
-[English](README.md) · [中文](README.zh-CN.md)
+[English](README.md) · [中文](README.zh-CN.md) · [使用说明](docs/usage.zh-CN.md)
 
 面向 AI 时代的 Git。本地仓库仍是标准 Git 对象、索引和引用，系统自带的 `git` 可以直接阅读。人和多个 agent 一起改代码时，服务端按项目规划决定谁能直接修改哪些目录。职责之内的改动进入分支；跨出职责的改动可以写在本地，但要经过评审或合并请求，才会进入目标分支。
 
@@ -56,6 +56,8 @@ AI 时代的开发和过去不一样：同一个人会在不同环境里驱动�
 - **多系统发布。** 推送到 `main` 会在 Linux、macOS、Windows 上测试并编译。推送 `v*` 标签时，把各平台可执行文件发布到 GitHub Release。
 
 ## 开始
+
+下面是最短的上手步骤。从建仓库、划分职责到评审、合并请求和 agent 接入的完整流程，见[使用说明](docs/usage.zh-CN.md)。
 
 安装 Rust 后：
 

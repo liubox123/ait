@@ -1,6 +1,6 @@
 # ait
 
-[English](README.md) · [中文](README.zh-CN.md)
+[English](README.md) · [中文](README.zh-CN.md) · [Usage guide](docs/usage.md)
 
 Git for the AI era. A local repository is still standard Git objects, an index, and refs, so the system `git` can read it. When people and agents edit together, the server uses a project plan to decide who may change which directories. Work inside a duty lands on the branch. Work outside that duty can be written locally, and it reaches the target branch only after a review or a merge request.
 
@@ -56,6 +56,8 @@ ait does not solve lost context or hard-to-undo large changes. Those still depen
 - **Multi-platform releases.** A push to `main` tests and builds on Linux, macOS, and Windows. A `v*` tag publishes the binaries on GitHub Releases.
 
 ## Start
+
+These are the shortest steps to get going. The [usage guide](docs/usage.md) walks through the full flow, from creating a repository and assigning duties to reviews, merge requests, and connecting agents.
 
 With Rust installed:
 
