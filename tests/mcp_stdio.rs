@@ -81,8 +81,13 @@ fn mcp_lists_permission_tools_and_reports_status() {
         read_message(&mut stdout)
     };
 
-    let init = call(1, "initialize", json!({}));
+    let init = call(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+    );
     assert_eq!(init["result"]["serverInfo"]["name"], "ait", "{init}");
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18", "{init}");
     let tools = call(2, "tools/list", json!({}));
     let names = tools["result"]["tools"]
         .as_array()
@@ -97,6 +102,11 @@ fn mcp_lists_permission_tools_and_reports_status() {
         "propose",
         "permissions",
         "owners",
+        "pull",
+        "merge",
+        "branch",
+        "checkout",
+        "pr",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -116,6 +126,41 @@ fn mcp_lists_permission_tools_and_reports_status() {
     );
     let history = log["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(history.contains("readme"), "{log}");
+
+    let text_of = |value: &serde_json::Value| {
+        value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let created = call(
+        5,
+        "tools/call",
+        json!({"name": "checkout", "arguments": {"target": "side", "create": true}}),
+    );
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    fs::write(dir.join("side.txt"), "side\n").unwrap();
+    let committed = call(
+        6,
+        "tools/call",
+        json!({"name": "commit", "arguments": {"message": "side", "paths": ["side.txt"]}}),
+    );
+    assert_eq!(committed["result"]["isError"], false, "{committed}");
+    let back = call(
+        7,
+        "tools/call",
+        json!({"name": "checkout", "arguments": {"target": "main"}}),
+    );
+    assert_eq!(back["result"]["isError"], false, "{back}");
+    let merged = call(
+        8,
+        "tools/call",
+        json!({"name": "merge", "arguments": {"branch": "side"}}),
+    );
+    assert!(text_of(&merged).contains("快进"), "{merged}");
+    assert_eq!(fs::read_to_string(dir.join("side.txt")).unwrap(), "side\n");
+    let branches = call(9, "tools/call", json!({"name": "branch", "arguments": {}}));
+    assert!(text_of(&branches).contains("\"side\""), "{branches}");
 
     let _ = child.kill();
     let _ = child.wait();
