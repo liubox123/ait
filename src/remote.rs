@@ -10,7 +10,10 @@ use serde::Serialize;
 use crate::git::{MergeOutcome, Oid, Repository};
 use crate::identity::{self, load_credential, save_credential, split_remote};
 use crate::perm::Manifest;
-use crate::store::{ObjectOut, PullResponse, PushResponse, RefsResponse};
+use crate::store::{PushResponse, RefsResponse};
+
+mod sync;
+pub use sync::*;
 
 pub struct Client {
     pub origin: String,
@@ -139,12 +142,23 @@ pub fn clone_repo(url: &str, dir: &Path) -> anyhow::Result<SyncReport> {
     let repo = Repository::init(dir, false)?;
     let remote_url = format!("{}/r/{}", client.origin, client.repo);
     repo.config_set("remote.origin.url", &remote_url)?;
-    repo.config_set("branch.main.remote", "origin")?;
-    repo.config_set("branch.main.merge", "refs/heads/main")?;
-    let manifest = fetch_repo(&repo, &client)?;
-    let message = if let Some(oid) = repo.resolve_ref("refs/remotes/origin/main")? {
+    repo.config_set("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
+    let refs = fetch_with_client(&repo, &client, "origin", false)?;
+    let manifest = refs.manifest;
+    let head = client_head(&client).unwrap_or_else(|| "main".into());
+    let branch = head.trim_start_matches("refs/heads/").to_string();
+    repo.config_set(&format!("branch.{branch}.remote"), "origin")?;
+    repo.config_set(&format!("branch.{branch}.merge"), &format!("refs/heads/{branch}"))?;
+    if branch != "main" {
+        repo.set_head_symbolic(&format!("refs/heads/{branch}"))?;
+    }
+    let message = if let Some(oid) = repo.resolve_ref(&format!("refs/remotes/origin/{branch}"))? {
         let (name, email) = identity::load_identity();
-        match repo.merge_oid(oid, "origin/main", &identity::signature_now(&name, &email))? {
+        match repo.merge_oid(
+            oid,
+            &format!("origin/{branch}"),
+            &identity::signature_now(&name, &email),
+        )? {
             MergeOutcome::FastForward(_) | MergeOutcome::Merged(_) | MergeOutcome::UpToDate => {
                 format!("已克隆到 {}，当前提交 {}", dir.display(), oid.short())
             }
@@ -157,66 +171,22 @@ pub fn clone_repo(url: &str, dir: &Path) -> anyhow::Result<SyncReport> {
 }
 
 pub fn fetch_repo(repo: &Repository, client: &Client) -> anyhow::Result<Manifest> {
+    Ok(fetch_with_client(repo, client, "origin", false)?.manifest)
+}
+
+fn client_head(client: &Client) -> Option<String> {
     let refs: RefsResponse = request_json(
         "GET",
         &format!("{}/api/git/{}/refs", client.origin, client.repo),
         Some(&client.token),
         None::<&()>,
-    )?;
-    let mut have: Vec<Oid> = repo
-        .list_refs("refs/")?
-        .into_iter()
-        .map(|(_, oid)| oid)
-        .collect();
-    for item in &refs.refs {
-        let response: PullResponse = request_json(
-            "POST",
-            &format!("{}/api/git/{}/pull", client.origin, client.repo),
-            Some(&client.token),
-            Some(&serde_json::json!({ "reference": item.name, "have": have })),
-        )?;
-        ingest(repo, &response.objects)?;
-        if !response.oid.is_zero() {
-            let short = item.name.trim_start_matches("refs/heads/");
-            repo.set_ref(&format!("refs/remotes/origin/{short}"), response.oid)?;
-            have.push(response.oid);
-        }
-    }
-    identity::save_manifest(repo.git_dir(), &refs.manifest)?;
-    Ok(refs.manifest)
+    )
+    .ok()?;
+    refs.head
 }
 
 pub fn pull_repo(repo: &Repository) -> anyhow::Result<SyncReport> {
-    let client = Client::from_repo(repo)?;
-    let manifest = fetch_repo(repo, &client)?;
-    let branch = repo.branch_name()?.unwrap_or_else(|| "main".into());
-    let Some(theirs) = repo.resolve_ref(&format!("refs/remotes/origin/{branch}"))? else {
-        return Ok(SyncReport {
-            message: "远端还没有提交".into(),
-            manifest,
-        });
-    };
-    let (name, email) = identity::load_identity();
-    let message = match repo.merge_oid(
-        theirs,
-        &format!("origin/{branch}"),
-        &identity::signature_now(&name, &email),
-    )? {
-        MergeOutcome::UpToDate => "已经是最新".into(),
-        MergeOutcome::FastForward(oid) => format!("快进到 {}", oid.short()),
-        MergeOutcome::Merged(oid) => format!("已合并，提交 {}", oid.short()),
-        MergeOutcome::Conflicts(paths) => {
-            return Err(anyhow::anyhow!(
-                "合并冲突，请修改这些文件后 ait add 再 ait commit:\n{}",
-                paths
-                    .iter()
-                    .map(|path| format!("  {path}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
-        }
-    };
-    Ok(SyncReport { message, manifest })
+    pull_with(repo, None, None, PullMode::Merge)
 }
 
 pub fn push_repo(repo: &Repository, force: bool) -> anyhow::Result<PushResponse> {
@@ -258,16 +228,7 @@ fn push_objects(
     } else {
         vec![remote_oid]
     };
-    let objects = repo.objects_since(head, &have)?;
-    let payload: Vec<_> = objects
-        .iter()
-        .map(|object| {
-            serde_json::json!({
-                "kind": object.kind,
-                "payload_b64": STANDARD.encode(&object.payload),
-            })
-        })
-        .collect();
+    let pack = STANDARD.encode(repo.pack_for(&[head], &have)?);
     let result: anyhow::Result<PushResponse> = request_json(
         "POST",
         &format!("{}/api/git/{}/push", client.origin, client.repo),
@@ -277,7 +238,8 @@ fn push_objects(
             "old_oid": remote_oid,
             "new_oid": head,
             "force": force,
-            "objects": payload,
+            "objects": [],
+            "pack_b64": pack,
         })),
     );
     match result {
@@ -427,19 +389,6 @@ pub fn policy(repo: &Repository) -> anyhow::Result<crate::perm::Policy> {
         Some(&client.token),
         None::<&()>,
     )
-}
-
-fn ingest(repo: &Repository, objects: &[ObjectOut]) -> anyhow::Result<()> {
-    for object in objects {
-        let bytes = STANDARD
-            .decode(object.payload_b64.trim())
-            .context("远端对象不是合法 base64")?;
-        let oid = repo.ingest(&object.kind, &bytes)?;
-        if oid != object.oid {
-            bail!("远端对象 {} 与内容不一致（实际是 {oid}）", object.oid);
-        }
-    }
-    Ok(())
 }
 
 fn request_json<T: DeserializeOwned, B: Serialize>(

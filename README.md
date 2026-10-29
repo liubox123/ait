@@ -56,7 +56,7 @@ The page listens on `http://127.0.0.1:7878`. Repository data stays in the `ait-d
 ```bash
 ait init
 ait add
-ait restore src/lib.rs --worktree
+ait restore --staged src/lib.rs
 ait status
 ait diff
 ait commit -m "message"
@@ -76,6 +76,41 @@ ait pr approve pr-1a2b3c4d
 ait pr merge pr-1a2b3c4d
 ait pr close pr-1a2b3c4d
 ```
+
+### Git-compatible commands
+
+Flags and behavior follow Git, and the repository stays readable and writable by system `git`.
+
+| Area | Commands |
+| --- | --- |
+| Undo and rewrite | `reset --soft/--mixed/--hard`, `revert`, `cherry-pick [-x] [-n]`, `commit --amend`, `stash push/list/show/apply/pop/drop/clear`, `checkout <rev> -- <path>`, `checkout --detach`, `switch -`, `restore [--staged] [--worktree] [--source <rev>]`, `rm [--cached] [-r]`, `mv`, `clean -n/-f/-d/-x`, `reflog` |
+| Rebase | `rebase <upstream> [--onto <base>]`, `rebase -i` (pick/reword/edit/squash/fixup/drop/exec/break; `--todo <file>` supplies the list directly), `--continue/--skip/--abort` |
+| Inspect | `rev-parse` (`~n`, `^n`, `^{tree}`, `@{n}`, `@{-n}`, `@{u}`, `rev:path`, `:/text`), `log` (`--oneline --graph --all -n --author --grep --since --until --first-parent --no-merges -p --stat --format`, `A..B`, `A...B`, `-- path`), `show`, `diff A B`, `blame [-L]`, `grep`, `tag [-a] [-d]`, `describe`, `shortlog`, `cat-file`, `ls-files`, `ls-tree`, `merge-base` |
+| Remotes | `remote add/remove/rename/set-url/get-url/-v`, `fetch [--all] [--prune]`, `pull [--rebase] [--ff-only]`, `push [-u] [-f] [--tags] [--delete] [<remote>] [<src>:<dst>]`, upstream tracking with `branch -u` |
+| Maintenance | `gc [--prune=now]`, `pack-refs`, `fsck`, `count-objects -v` |
+
+`pull` and `push` move objects as packs. When the server rejects a push, the objects stay in an in-memory quarantine and never reach the server repository.
+
+### System Git clients
+
+The server speaks Git smart HTTP (protocol v2 for fetch, with v0 fallback, and receive-pack for push). Permissions, protected branches, and review rules are the same as for `ait push`:
+
+```bash
+git clone http://alice@127.0.0.1:7878/r/shop.git
+git push origin main
+git push origin v1.0
+git push origin --delete old-branch
+```
+
+Use the ait account name as the user name and either the password or an ait token as the password. When a push is turned into a review, `git push` reports `remote rejected` with the review id.
+
+### Accounts and branch protection
+
+- `POST /api/password` `{ old_password, new_password }` changes the password, signs out every session of that user, and returns a new token.
+- `POST /api/logout-all` signs out every session of the current user.
+- Tokens expire after 30 days by default. Set `AIT_TOKEN_TTL_DAYS` to change this, or `0` to disable expiry.
+- `GET/PUT /api/repos/:name/protected` `{ patterns: ["main", "release/*"] }` lists protected branches, `main` and `master` by default. Protected branches cannot be deleted, and pushes to them that exceed the pusher's permissions or duty limits become reviews.
+- A branch can be deleted by whoever created it or by a repository owner. Only owners can push, move, or delete tags, and moving an existing tag needs `--force`.
 
 ## Plans and models
 
@@ -145,6 +180,6 @@ ait is licensed under the [GNU General Public License v3](LICENSE). You may run,
 
 ## Relation to Git
 
-The shared everyday operations are init, add, status, diff, commit, branch, checkout, fast-forward, three-way merge, log, and reading packs from `git gc`.
+Interoperable today: the commands in the table above, reading and writing pack and idx v2 files (including deltas), reflogs, annotated tags, and system `git` cloning, fetching, and pushing to an ait server over smart HTTP.
 
-Still ahead: rebase, stash, bisect, submodules, signed tags, and the Git smart transfer protocol. Pushing to GitHub still uses system Git. Permissions, reviews, and merge requests happen when `ait push` or `ait pr` talks to an ait server. Objects are stored loose, plus any packs already present, which suits small and medium repositories.
+Still ahead: bisect, submodules, linked worktrees, shallow and partial clones, signed tags and commits, the SSH transport, and octopus merges. Pushing to GitHub still uses system Git. Permissions, reviews, and merge requests happen when you push to an ait server.

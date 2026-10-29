@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -18,6 +19,18 @@ use super::odb;
 use super::oid::Oid;
 use super::pack::PackCache;
 use std::cell::RefCell;
+
+mod maint;
+mod refs_log;
+mod rewrite;
+mod stash;
+mod view;
+
+pub use refs_log::ReflogEntry;
+pub use rewrite::{CleanOptions, ResetMode, RestoreSource, SeqOutcome, Todo, TodoAction};
+pub use stash::StashEntry;
+pub use maint::{FsckReport, GcReport, ObjectCount};
+pub use view::{render_graph, BlameLine, DiffSide, GraphRow, GrepMatch, GrepOptions, LogFilter, TagInfo};
 
 #[derive(Clone, Debug)]
 pub enum Head {
@@ -108,6 +121,7 @@ pub struct Repository {
     git_dir: PathBuf,
     work_tree: Option<PathBuf>,
     packs: RefCell<Option<PackCache>>,
+    staged: RefCell<HashMap<Oid, (&'static str, Vec<u8>)>>,
 }
 
 impl Repository {
@@ -147,6 +161,7 @@ impl Repository {
             git_dir,
             work_tree,
             packs: RefCell::new(None),
+            staged: RefCell::new(HashMap::new()),
         })
     }
 
@@ -216,6 +231,7 @@ impl Repository {
             git_dir,
             work_tree,
             packs: RefCell::new(None),
+            staged: RefCell::new(HashMap::new()),
         }
     }
 
@@ -283,13 +299,26 @@ impl Repository {
         bail!("引用嵌套过深");
     }
 
-    pub fn rev_parse(&self, name: &str) -> anyhow::Result<Oid> {
+    /// 只解析名字本身：HEAD、引用、分支、标签、远端分支和（缩写）对象名，不处理 `~`、`^`、`@{}`。
+    fn resolve_name(&self, name: &str) -> anyhow::Result<Oid> {
         let name = name.trim();
         if name.is_empty() {
             bail!("缺少版本参数");
         }
-        if name == "HEAD" {
+        if name == "HEAD" || name == "@" {
             return self.head_oid()?.context("当前还没有提交");
+        }
+        if matches!(
+            name,
+            "ORIG_HEAD" | "MERGE_HEAD" | "FETCH_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD"
+        ) {
+            let path = self.git_dir.join(name);
+            if path.is_file() {
+                let text = fs::read_to_string(path)?;
+                let first = text.split_whitespace().next().unwrap_or("");
+                return Oid::parse(first);
+            }
+            bail!("{name} 不存在");
         }
         if name.starts_with("refs/") {
             return self
@@ -317,10 +346,37 @@ impl Repository {
     }
 
     pub fn set_ref(&self, name: &str, oid: Oid) -> anyhow::Result<()> {
+        self.set_ref_logged(name, oid, "update by ait")
+    }
+
+    /// 写引用并记 reflog；HEAD 指向这个引用时，HEAD 的 reflog 也记一笔。
+    pub fn set_ref_logged(&self, name: &str, oid: Oid, message: &str) -> anyhow::Result<()> {
         if !name.starts_with("refs/") || !valid_ref(name) {
             bail!("非法引用名 {name}");
         }
-        atomic_write(&self.git_dir.join(name), format!("{oid}\n").as_bytes())
+        let old = self.resolve_ref(name)?.unwrap_or(Oid::ZERO);
+        atomic_write(&self.git_dir.join(name), format!("{oid}\n").as_bytes())?;
+        if old != oid {
+            self.append_reflog(name, old, oid, message)?;
+            if matches!(self.head(), Ok(Head::Symbolic(ref target)) if target == name) {
+                self.append_reflog("HEAD", old, oid, message)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 让 HEAD 指向新提交：在分支上就移动分支，分离状态就直接改 HEAD。
+    pub fn update_head(&self, oid: Oid, message: &str) -> anyhow::Result<()> {
+        match self.head()? {
+            Head::Symbolic(name) => self.set_ref_logged(&name, oid, message),
+            Head::Detached(old) => {
+                self.set_head_detached(oid)?;
+                if old != oid {
+                    self.append_reflog("HEAD", old, oid, message)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     pub fn delete_ref(&self, name: &str) -> anyhow::Result<()> {
@@ -330,6 +386,10 @@ impl Repository {
         let path = self.git_dir.join(name);
         if path.exists() {
             fs::remove_file(path)?;
+        }
+        let log = self.git_dir.join("logs").join(name);
+        if log.is_file() {
+            let _ = fs::remove_file(log);
         }
         self.rewrite_packed_without(name)
     }
@@ -387,7 +447,7 @@ impl Repository {
         if self.resolve_ref(&refname)?.is_some() {
             bail!("分支已存在: {name}");
         }
-        self.set_ref(&refname, oid)
+        self.set_ref_logged(&refname, oid, "branch: Created from HEAD")
     }
 
     pub fn delete_branch(&self, name: &str) -> anyhow::Result<()> {
@@ -405,15 +465,11 @@ impl Repository {
         if let Some(raw) = odb::read_loose(&self.git_dir, oid)? {
             return odb::parse_stored(&raw);
         }
-        {
-            let mut slot = self.packs.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(PackCache::load(&self.git_dir)?);
-            }
-        }
-        let slot = self.packs.borrow();
-        if let Some(found) = slot.as_ref().and_then(|packs| packs.get(oid)) {
+        if let Some(found) = self.with_packs(|packs| packs.get(oid))? {
             return found;
+        }
+        if let Some((kind, payload)) = self.staged.borrow().get(&oid) {
+            return Object::parse(kind, payload);
         }
         bail!("找不到对象 {oid}")
     }
@@ -528,31 +584,37 @@ impl Repository {
     }
 
     pub fn log(&self, start: Oid, limit: usize) -> anyhow::Result<Vec<CommitView>> {
-        let mut commits = Vec::new();
-        let mut stack = vec![start];
+        // 与 git log 相同：按提交时间从新到旧弹出，父提交只在子提交弹出后才入队，
+        // 所以时间相同时子提交也排在父提交前面。
+        let mut queue: BinaryHeap<(i64, Reverse<u64>, Oid)> = BinaryHeap::new();
+        let mut pending: HashMap<Oid, Commit> = HashMap::new();
         let mut seen = HashSet::new();
-        let cap = limit.saturating_mul(30).max(limit).min(5000);
-        while let Some(oid) = stack.pop() {
-            if !seen.insert(oid) {
-                continue;
+        let mut seq = 0u64;
+        let mut frontier = vec![start];
+        let mut commits = Vec::new();
+        loop {
+            for oid in frontier.drain(..) {
+                if !seen.insert(oid) {
+                    continue;
+                }
+                if let Ok(Object::Commit(commit)) = self.read_object(oid) {
+                    queue.push((commit.committer.time, Reverse(seq), oid));
+                    pending.insert(oid, commit);
+                    seq += 1;
+                }
             }
-            let commit = match self.read_object(oid) {
-                Ok(Object::Commit(commit)) => commit,
-                _ => continue,
-            };
-            stack.extend(commit.parents.iter().copied());
-            commits.push((oid, commit));
-            if commits.len() >= cap {
+            if commits.len() >= limit {
                 break;
             }
+            let Some((_, _, oid)) = queue.pop() else {
+                break;
+            };
+            let Some(commit) = pending.remove(&oid) else {
+                continue;
+            };
+            frontier.extend(commit.parents.iter().copied());
+            commits.push((oid, commit));
         }
-        commits.sort_by(|a, b| {
-            b.1.committer
-                .time
-                .cmp(&a.1.committer.time)
-                .then(b.0.cmp(&a.0))
-        });
-        commits.truncate(limit);
         Ok(commits
             .into_iter()
             .map(|(oid, commit)| CommitView {
@@ -829,72 +891,40 @@ impl Repository {
         self.forget_conflicts(&specs)
     }
 
-    /// 把路径在暂存区里还原成 HEAD 的版本；`worktree` 为 true 时工作区文件也一并还原，HEAD 里没有的文件会被删掉。
-    pub fn restore(&self, specs: &[String], worktree: bool) -> anyhow::Result<Vec<String>> {
-        self.work_tree_required()?;
-        if specs.is_empty() {
-            bail!("请指定要还原的路径");
-        }
-        let head = self.head_files()?;
-        let mut index = self.read_index()?;
-        let mut targets = BTreeSet::new();
-        for spec in specs {
-            let rel = self.resolve_spec(spec)?;
-            let covers =
-                |path: &str| rel.is_empty() || path == rel || path.starts_with(&format!("{rel}/"));
-            targets.extend(head.keys().filter(|path| covers(path)).cloned());
-            targets.extend(
-                index
-                    .entries
-                    .iter()
-                    .filter(|entry| covers(&entry.path))
-                    .map(|entry| entry.path.clone()),
-            );
-            if worktree && !rel.is_empty() && self.work_path(&rel)?.is_file() {
-                targets.insert(rel.clone());
-            }
-        }
-        if targets.is_empty() {
-            bail!("这些路径没有可还原的内容: {}", specs.join(", "));
-        }
-        for path in &targets {
-            index.remove(path);
-            match head.get(path) {
-                Some((mode, oid)) => {
-                    let stat = if worktree {
-                        self.materialize(path, *mode, *oid)?;
-                        index::stat_path(&self.work_path(path)?)?.1
-                    } else {
-                        FileStat::default()
-                    };
-                    index.upsert(IndexEntry {
-                        path: path.clone(),
-                        mode: *mode,
-                        oid: *oid,
-                        stat,
-                        stage: 0,
-                    });
-                }
-                None if worktree => {
-                    let disk = self.work_path(path)?;
-                    if fs::symlink_metadata(&disk).is_ok() {
-                        fs::remove_file(&disk)?;
-                    }
-                }
-                None => {}
-            }
-        }
-        self.write_index_file(&index)?;
-        self.forget_conflicts(specs)?;
-        Ok(targets.into_iter().collect())
+    pub fn commit(&self, message: &str, all: bool, author: &Signature) -> anyhow::Result<Oid> {
+        self.commit_with(message, all, author, false)
     }
 
-    pub fn commit(&self, message: &str, all: bool, author: &Signature) -> anyhow::Result<Oid> {
-        let message = message.trim();
+    /// `amend` 时沿用原提交的父提交和作者；说明为空则沿用原说明。
+    /// 拣选冲突解决后提交时，作者沿用被拣选的提交。
+    pub fn commit_with(
+        &self,
+        message: &str,
+        all: bool,
+        committer: &Signature,
+        amend: bool,
+    ) -> anyhow::Result<Oid> {
+        let mut message = message.trim().to_string();
+        let picking = self.pick_head()?;
+        let merging = self.merge_head()?;
+        if amend && merging.is_some() {
+            bail!("合并进行中不能 --amend");
+        }
+        if message.is_empty() {
+            if amend {
+                let head = self.head_oid()?.context("还没有提交，不能 --amend")?;
+                message = self.read_commit(head)?.message.trim().to_string();
+            } else if merging.is_some() || picking.is_some() || self.revert_head()?.is_some() {
+                message = fs::read_to_string(self.git_dir.join("MERGE_MSG"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            }
+        }
         if message.is_empty() {
             bail!("提交说明不能为空");
         }
-        if self.merge_head()?.is_some() {
+        if merging.is_some() || picking.is_some() || self.revert_head()?.is_some() {
             let marked = self.find_conflict_markers()?;
             if !marked.is_empty() {
                 bail!("仍有冲突标记: {}", marked.join(", "));
@@ -908,40 +938,60 @@ impl Repository {
             self.stage_tracked()?;
         }
         let index = self.read_index()?;
+        if index.entries.iter().any(|entry| entry.stage > 0) {
+            bail!("暂存区仍有未合并的路径，请先 ait add");
+        }
         if index.entries.is_empty() && self.head_oid()?.is_none() {
             bail!("没有需要提交的内容");
         }
         let tree = self.write_tree(&index_map(&index))?;
         let mut parents = Vec::new();
-        if let Some(head) = self.head_oid()? {
+        let mut author = committer.clone();
+        let kind;
+        if amend {
+            let head = self.head_oid()?.context("还没有提交，不能 --amend")?;
+            let old = self.read_commit(head)?;
+            parents = old.parents;
+            author = old.author;
+            kind = "commit (amend)";
+        } else if let Some(head) = self.head_oid()? {
             let current = self.read_commit(head)?;
-            if current.tree == tree && self.merge_head()?.is_none() {
+            if current.tree == tree && merging.is_none() {
                 bail!("没有需要提交的内容");
             }
             parents.push(head);
-            if let Some(extra) = self.merge_head()? {
+            if let Some(extra) = merging {
                 if extra != head {
                     parents.push(extra);
                 }
             }
+            if let Some(picked) = picking {
+                author = self.read_commit(picked)?.author;
+            }
+            kind = if parents.len() > 1 {
+                "commit (merge)"
+            } else {
+                "commit"
+            };
+        } else {
+            kind = "commit (initial)";
         }
-        let mut text = message.to_string();
+        let mut text = message;
         if !text.ends_with('\n') {
             text.push('\n');
         }
+        let summary = text.lines().next().unwrap_or("").to_string();
         let commit = Commit {
             tree,
             parents,
-            author: author.clone(),
-            committer: author.clone(),
+            author,
+            committer: committer.clone(),
             message: text,
         };
         let oid = self.write_object("commit", &commit.encode())?;
-        match self.head()? {
-            Head::Symbolic(name) => self.set_ref(&name, oid)?,
-            Head::Detached(_) => self.set_head_detached(oid)?,
-        }
+        self.update_head(oid, &format!("{kind}: {summary}"))?;
         self.clear_merge()?;
+        self.clear_pick()?;
         Ok(oid)
     }
 
@@ -972,13 +1022,45 @@ impl Repository {
     }
 
     pub fn checkout(&self, target: &str, create: bool) -> anyhow::Result<String> {
+        self.checkout_from(target, create, None)
+    }
+
+    /// `create` 时以 `start`（默认 HEAD）为起点建分支并切换。目标不是分支时分离 HEAD。
+    pub fn checkout_from(
+        &self,
+        target: &str,
+        create: bool,
+        start: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let from = self.head_label()?;
+        let old = self.head_oid()?;
         if create {
             if !valid_branch(target) {
                 bail!("非法分支名: {target}");
             }
-            let oid = self.head_oid()?.context("还没有提交，不能创建分支")?;
-            self.create_branch(target, oid)?;
+            let oid = match start {
+                Some(spec) => self.rev_parse(spec)?,
+                None => old.context("还没有提交，不能创建分支")?,
+            };
+            if self.resolve_ref(&format!("refs/heads/{target}"))?.is_some() {
+                bail!("分支已存在: {target}");
+            }
+            self.switch_to(oid)?;
+            self.set_ref_logged(
+                &format!("refs/heads/{target}"),
+                oid,
+                &format!("branch: Created from {}", start.unwrap_or("HEAD")),
+            )?;
             self.set_head_symbolic(&format!("refs/heads/{target}"))?;
+            self.append_reflog(
+                "HEAD",
+                old.unwrap_or(Oid::ZERO),
+                oid,
+                &format!("checkout: moving from {from} to {target}"),
+            )?;
+            if let Some(spec) = start {
+                self.track_if_remote(target, spec)?;
+            }
             return Ok(format!("已创建并切换到分支 {target}"));
         }
         let branch_ref = format!("refs/heads/{target}");
@@ -986,13 +1068,68 @@ impl Repository {
             if let Some(oid) = self.resolve_ref(&branch_ref)? {
                 self.switch_to(oid)?;
                 self.set_head_symbolic(&branch_ref)?;
+                self.append_reflog(
+                    "HEAD",
+                    old.unwrap_or(Oid::ZERO),
+                    oid,
+                    &format!("checkout: moving from {from} to {target}"),
+                )?;
                 return Ok(format!("已切换到分支 {target}"));
+            }
+            if let Some(remote) = self.unique_remote_branch(target)? {
+                return self.checkout_from(target, true, Some(&remote));
             }
         }
         let oid = self.rev_parse(target)?;
         self.switch_to(oid)?;
         self.set_head_detached(oid)?;
+        self.append_reflog(
+            "HEAD",
+            old.unwrap_or(Oid::ZERO),
+            oid,
+            &format!("checkout: moving from {from} to {target}"),
+        )?;
         Ok(format!("已分离 HEAD 到 {}", oid.short()))
+    }
+
+    fn head_label(&self) -> anyhow::Result<String> {
+        Ok(match self.head()? {
+            Head::Symbolic(name) => name.trim_start_matches("refs/heads/").to_string(),
+            Head::Detached(oid) => oid.to_hex(),
+        })
+    }
+
+    /// 只有一个远端有同名分支时返回 `<远端>/<分支>`，用于 `checkout <分支>` 自动建跟踪分支。
+    fn unique_remote_branch(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let found: Vec<String> = self
+            .list_refs("refs/remotes/")?
+            .into_iter()
+            .filter_map(|(refname, _)| {
+                let short = refname.trim_start_matches("refs/remotes/");
+                let (_, branch) = short.split_once('/')?;
+                (branch == name).then(|| short.to_string())
+            })
+            .collect();
+        Ok(if found.len() == 1 {
+            found.into_iter().next()
+        } else {
+            None
+        })
+    }
+
+    fn track_if_remote(&self, branch: &str, start: &str) -> anyhow::Result<()> {
+        let full = format!("refs/remotes/{start}");
+        if self.resolve_ref(&full).ok().flatten().is_none() {
+            return Ok(());
+        }
+        if let Some((remote, upstream)) = start.split_once('/') {
+            self.config_set(&format!("branch.{branch}.remote"), remote)?;
+            self.config_set(
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{upstream}"),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn merge_oid(
@@ -1016,10 +1153,7 @@ impl Repository {
         let Some(ours) = self.head_oid()? else {
             let commit = self.read_commit(theirs)?;
             self.checkout_files(&self.tree_files(commit.tree)?)?;
-            match self.head()? {
-                Head::Symbolic(name) => self.set_ref(&name, theirs)?,
-                Head::Detached(_) => self.set_head_detached(theirs)?,
-            }
+            self.update_head(theirs, &format!("merge {label}: Fast-forward"))?;
             return Ok(MergeOutcome::FastForward(theirs));
         };
         if ours == theirs || self.is_ancestor(theirs, ours)? {
@@ -1036,10 +1170,7 @@ impl Repository {
                 return self.write_merge_commit(ours, theirs, label, author);
             }
             self.switch_to(theirs)?;
-            match self.head()? {
-                Head::Symbolic(name) => self.set_ref(&name, theirs)?,
-                Head::Detached(_) => self.set_head_detached(theirs)?,
-            }
+            self.update_head(theirs, &format!("merge {label}: Fast-forward"))?;
             return Ok(MergeOutcome::FastForward(theirs));
         }
         if options.ff_only {
@@ -1147,10 +1278,10 @@ impl Repository {
             message: format!("Merge {label}\n"),
         };
         let oid = self.write_object("commit", &commit.encode())?;
-        match self.head()? {
-            Head::Symbolic(name) => self.set_ref(&name, oid)?,
-            Head::Detached(_) => self.set_head_detached(oid)?,
-        }
+        self.update_head(
+            oid,
+            &format!("merge {label}: Merge made by the 'ort' strategy."),
+        )?;
         self.clear_merge()?;
         Ok(MergeOutcome::Merged(oid))
     }
@@ -1395,6 +1526,134 @@ impl Repository {
         let path = self.git_dir.join("config");
         let text = fs::read_to_string(&path).unwrap_or_default();
         atomic_write(&path, config_upsert(&text, key, value).as_bytes())
+    }
+
+    /// 删除一个配置项；所在小节因此变空时整节删掉。
+    pub fn config_unset_section_key(&self, key: &str) -> anyhow::Result<()> {
+        let Some((section, subsection, name)) = split_config_key(key) else {
+            bail!("非法配置项 {key}");
+        };
+        let path = self.git_dir.join("config");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let mut out: Vec<String> = Vec::new();
+        let mut in_section = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_section = header_matches(trimmed, &section, subsection.as_deref());
+                out.push(line.to_string());
+                continue;
+            }
+            if in_section {
+                if let Some((left, _)) = trimmed.split_once('=') {
+                    if left.trim() == name {
+                        continue;
+                    }
+                }
+            }
+            out.push(line.to_string());
+        }
+        let mut cleaned: Vec<String> = Vec::new();
+        for (index, line) in out.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                let empty = out[index + 1..]
+                    .iter()
+                    .take_while(|next| !next.trim().starts_with('['))
+                    .all(|next| next.trim().is_empty());
+                if empty {
+                    continue;
+                }
+            }
+            cleaned.push(line.clone());
+        }
+        let mut text = cleaned.join("\n");
+        text.push('\n');
+        atomic_write(&path, text.as_bytes())
+    }
+
+    /// 删除整个配置小节，例如 `remote.origin`。
+    pub fn config_remove_section(&self, section: &str) -> anyhow::Result<()> {
+        let (name, sub) = match section.split_once('.') {
+            Some((name, sub)) => (name.to_string(), Some(sub.to_string())),
+            None => (section.to_string(), None),
+        };
+        let path = self.git_dir.join("config");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let mut out = Vec::new();
+        let mut skipping = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                skipping = header_matches(trimmed, &name, sub.as_deref());
+            }
+            if !skipping {
+                out.push(line);
+            }
+        }
+        let mut text = out.join("\n");
+        text.push('\n');
+        atomic_write(&path, text.as_bytes())
+    }
+
+    /// 配置文件里所有 `[section "x"]` 的 x。
+    pub fn config_subsections(&self, section: &str) -> anyhow::Result<Vec<String>> {
+        let text = fs::read_to_string(self.git_dir.join("config")).unwrap_or_default();
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(header) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                if let Some((sec, sub)) = header.split_once(' ') {
+                    if sec.trim() == section {
+                        let sub = sub.trim().trim_matches('"').to_string();
+                        if !out.contains(&sub) {
+                            out.push(sub);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn rename_branch(&self, old: &str, new: &str, force: bool) -> anyhow::Result<()> {
+        if !valid_branch(new) {
+            bail!("非法分支名: {new}");
+        }
+        let old_ref = format!("refs/heads/{old}");
+        let new_ref = format!("refs/heads/{new}");
+        let oid = self
+            .resolve_ref(&old_ref)?
+            .with_context(|| format!("分支不存在: {old}"))?;
+        if old == new {
+            return Ok(());
+        }
+        if self.resolve_ref(&new_ref)?.is_some() && !force {
+            bail!("分支已存在: {new}");
+        }
+        let current = self.branch_name()?.as_deref() == Some(old);
+        let old_log = self.git_dir.join("logs").join(&old_ref);
+        let new_log = self.git_dir.join("logs").join(&new_ref);
+        let saved_log = fs::read(&old_log).ok();
+        atomic_write(&self.git_dir.join(&new_ref), format!("{oid}\n").as_bytes())?;
+        if let Some(bytes) = saved_log {
+            if let Some(parent) = new_log.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&new_log, bytes)?;
+        }
+        if current {
+            self.set_head_symbolic(&new_ref)?;
+        }
+        self.delete_ref(&old_ref)?;
+        self.append_reflog(&new_ref, oid, oid, &format!("Branch: renamed {old_ref} to {new_ref}"))?;
+        for key in ["remote", "merge"] {
+            if let Some(value) = self.config_get(&format!("branch.{old}.{key}"))? {
+                self.config_set(&format!("branch.{new}.{key}"), &value)?;
+            }
+        }
+        self.config_remove_section(&format!("branch.{old}"))?;
+        Ok(())
     }
 
     pub fn description(&self) -> anyhow::Result<String> {
@@ -1889,7 +2148,14 @@ impl Repository {
                 }
                 Ok(Object::Tree(entries)) => {
                     for entry in entries {
-                        stack.push(entry.oid);
+                        if entry.mode != 0o160000 {
+                            stack.push(entry.oid);
+                        }
+                    }
+                }
+                Ok(Object::Tag(payload)) => {
+                    if let Ok(tag) = super::object::TagObject::parse(&payload) {
+                        stack.push(tag.object);
                     }
                 }
                 _ => {}
@@ -1927,17 +2193,9 @@ impl Repository {
                 }
             }
         }
-        {
-            let mut slot = self.packs.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(PackCache::load(&self.git_dir)?);
-            }
-            if let Some(packs) = slot.as_ref() {
-                for oid in packs.oids() {
-                    if oid.to_hex().starts_with(prefix) {
-                        found.push(oid);
-                    }
-                }
+        for oid in self.with_packs(|packs| packs.oids())? {
+            if oid.to_hex().starts_with(prefix) {
+                found.push(oid);
             }
         }
         found.sort();
@@ -2327,6 +2585,29 @@ mod tests {
         assert_eq!(commit.summary(), "first");
         let files = repo.tree_files(commit.tree).unwrap();
         assert_eq!(files["hello.txt"].1, hash_payload("blob", b"hello\n").0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_lists_children_before_parents_within_the_same_second() {
+        let (dir, repo) = temp_repo();
+        let author = Signature {
+            name: "A".into(),
+            email: "a@b.c".into(),
+            time: 1_700_000_000,
+            tz: "+0000".into(),
+        };
+        let mut oids = Vec::new();
+        for index in 0..4 {
+            fs::write(dir.join("n.txt"), format!("{index}\n")).unwrap();
+            repo.add(&["n.txt".into()]).unwrap();
+            oids.push(repo.commit(&format!("c{index}"), false, &author).unwrap());
+        }
+        let head = *oids.last().unwrap();
+        let listed: Vec<Oid> = repo.log(head, 10).unwrap().iter().map(|view| view.oid).collect();
+        oids.reverse();
+        assert_eq!(listed, oids);
+        assert_eq!(repo.log(head, 1).unwrap()[0].oid, head);
         let _ = fs::remove_dir_all(dir);
     }
 }

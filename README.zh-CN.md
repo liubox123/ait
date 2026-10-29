@@ -56,7 +56,7 @@ docker compose up -d --build
 ```bash
 ait init
 ait add
-ait restore src/lib.rs --worktree
+ait restore --staged src/lib.rs
 ait status
 ait diff
 ait commit -m "说明"
@@ -76,6 +76,41 @@ ait pr approve pr-1a2b3c4d
 ait pr merge pr-1a2b3c4d
 ait pr close pr-1a2b3c4d
 ```
+
+### 与 Git 相同的命令
+
+参数和行为按 Git 的习惯实现，仓库仍可直接交给系统 `git` 读写。
+
+| 类别 | 命令 |
+| --- | --- |
+| 撤销与改写 | `reset --soft/--mixed/--hard`、`revert`、`cherry-pick [-x] [-n]`、`commit --amend`、`stash push/list/show/apply/pop/drop/clear`、`checkout <版本> -- <路径>`、`checkout --detach`、`switch -`、`restore [--staged] [--worktree] [--source <版本>]`、`rm [--cached] [-r]`、`mv`、`clean -n/-f/-d/-x`、`reflog` |
+| 变基 | `rebase <上游> [--onto <基点>]`、`rebase -i`（pick/reword/edit/squash/fixup/drop/exec/break，`--todo <文件>` 可直接给出清单）、`--continue/--skip/--abort` |
+| 查看 | `rev-parse`（`~n`、`^n`、`^{tree}`、`@{n}`、`@{-n}`、`@{u}`、`版本:路径`、`:/文字`）、`log`（`--oneline --graph --all -n --author --grep --since --until --first-parent --no-merges -p --stat --format`、`A..B`、`A...B`、`-- 路径`）、`show`、`diff A B`、`blame [-L]`、`grep`、`tag [-a] [-d]`、`describe`、`shortlog`、`cat-file`、`ls-files`、`ls-tree`、`merge-base` |
+| 远端 | `remote add/remove/rename/set-url/get-url/-v`、`fetch [--all] [--prune]`、`pull [--rebase] [--ff-only]`、`push [-u] [-f] [--tags] [--delete] [<远端>] [<源>:<目标>]`、上游跟踪 `branch -u` |
+| 维护 | `gc [--prune=now]`、`pack-refs`、`fsck`、`count-objects -v` |
+
+`pull` 和 `push` 用 pack 传输对象；推送被拒绝时，对象只留在内存隔离区，不写入服务端仓库。
+
+### 系统 Git 客户端
+
+服务端支持 Git smart HTTP（拉取用协议 v2，也兼容 v0；推送用 receive-pack）。权限、受保护分支和评审规则与 `ait push` 相同：
+
+```bash
+git clone http://alice@127.0.0.1:7878/r/shop.git
+git push origin main
+git push origin v1.0
+git push origin --delete old-branch
+```
+
+用户名填 ait 账号，口令可以是登录密码，也可以是 ait 令牌。越权改动被转为评审时，`git push` 会显示 `remote rejected` 和评审编号。
+
+### 账号与分支保护
+
+- `POST /api/password` `{ old_password, new_password }`：修改密码，注销该用户的全部会话并返回新令牌。
+- `POST /api/logout-all`：注销当前用户的全部会话。
+- 令牌默认 30 天过期，用 `AIT_TOKEN_TTL_DAYS` 调整，设为 `0` 表示不过期。
+- `GET/PUT /api/repos/:name/protected` `{ patterns: ["main", "release/*"] }`：受保护分支，默认 `main`、`master`。受保护分支不能删除；推送到受保护分支时，越权或超出职责限制的改动转为评审。
+- 删除分支：建分支的人或仓库所有者可以删。推送、移动、删除标签只限仓库所有者，移动已有标签需要 `--force`。
 
 ## 规划与模型
 
@@ -145,6 +180,6 @@ ait 按照 [GNU 通用公共许可证第三版](LICENSE)（GNU GPL v3）授权�
 
 ## 和 Git 的边界
 
-已互通的日常能力：初始化、暂存、状态、差异、提交、分支、检出、快进、三方合并、日志，以及读取 `git gc` 生成的 pack。
+已互通：上面表格里的命令，pack 与 idx v2 的读写（含增量对象），reflog，附注标签，系统 `git` 通过 smart HTTP 克隆、拉取和推送 ait 服务。
 
-还没有：rebase、stash、bisect、子模块、标签签名、Git 智能传输协议。推送到 GitHub 仍用系统 Git。ait 的权限、评审和合并请求发生在 `ait push` / `ait pr` 到 ait 服务的时候。对象以 loose 和已有 pack 保存，适合中小仓库。
+还没有：bisect、子模块、工作树（worktree）、浅克隆和部分克隆、标签与提交签名、SSH 传输、合并策略 octopus。推送到 GitHub 仍用系统 Git。ait 的权限、评审和合并请求发生在推送到 ait 服务的时候。

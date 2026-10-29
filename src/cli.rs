@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 
-use crate::git::{unified_diff, ChangeKind, Repository};
+use crate::git::{ChangeKind, Repository};
 use crate::identity::{self, load_manifest};
 use crate::perm::Access;
 use crate::remote;
+
+mod porcelain;
 
 pub fn execute() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -33,75 +35,6 @@ pub fn execute() -> anyhow::Result<()> {
             let repo = open_repo()?;
             repo.add(&paths)?;
             println!("已更新索引");
-        }
-        Command::Restore { paths, worktree } => {
-            let restored = open_repo()?.restore(&paths, worktree)?;
-            println!("已还原 {}", restored.join(", "));
-        }
-        Command::Status => print_status(&open_repo()?)?,
-        Command::Diff { cached } => {
-            let repo = open_repo()?;
-            let files = if cached {
-                repo.diff_staged()?
-            } else {
-                repo.diff_unstaged()?
-            };
-            let text = unified_diff(&files);
-            if text.is_empty() {
-                println!("没有差异");
-            } else {
-                print!("{text}");
-            }
-        }
-        Command::Commit { message, all } => {
-            let repo = open_repo()?;
-            let (name, email) = identity::load_identity();
-            if name == "Ait" && email == "ait@local" {
-                eprintln!("提示: 正在使用默认身份 Ait <ait@local>，可用 ait config user.name 修改");
-            }
-            let oid = repo.commit(&message, all, &identity::signature_now(&name, &email))?;
-            let branch = repo.branch_name()?.unwrap_or_else(|| "HEAD".into());
-            println!("[{branch} {}] {message}", oid.short());
-        }
-        Command::Log { max_count } => {
-            let repo = open_repo()?;
-            let Some(head) = repo.head_oid()? else {
-                println!("还没有提交");
-                return Ok(());
-            };
-            for commit in repo.log(head, max_count)? {
-                println!("commit {}", commit.oid);
-                println!("Author: {} <{}>", commit.author_name, commit.author_email);
-                println!("Date:   {}", identity::format_time(commit.time, &commit.tz));
-                println!();
-                for line in commit.message.lines() {
-                    println!("    {line}");
-                }
-                println!();
-            }
-        }
-        Command::Branch { name, delete } => {
-            let repo = open_repo()?;
-            if delete {
-                let name = name.context("请指定要删除的分支")?;
-                repo.delete_branch(&name)?;
-                println!("已删除分支 {name}");
-            } else if let Some(name) = name {
-                let oid = repo.head_oid()?.context("还没有提交，不能创建分支")?;
-                repo.create_branch(&name, oid)?;
-                println!("已创建分支 {name}");
-            } else {
-                for branch in repo.branches()? {
-                    let mark = if branch.current { "* " } else { "  " };
-                    println!("{mark}{} {}", branch.name, branch.oid.short());
-                }
-            }
-        }
-        Command::Checkout { target, create } => {
-            println!("{}", open_repo()?.checkout(&target, create)?);
-        }
-        Command::Switch { target } => {
-            println!("{}", open_repo()?.checkout(&target, false)?);
         }
         Command::Merge {
             branch,
@@ -165,48 +98,6 @@ pub fn execute() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Push { force } => {
-            let response = remote::push_repo(&open_repo()?, force)?;
-            println!("{}", response.message);
-            if !response.blocked.is_empty() {
-                println!("需要评审的路径:");
-                for path in &response.blocked {
-                    println!("  {path}");
-                }
-            }
-            print!("{}", response.manifest.render());
-        }
-        Command::Pull => {
-            let report = remote::pull_repo(&open_repo()?)?;
-            println!("{}", report.message);
-            print!("{}", report.manifest.render());
-        }
-        Command::Fetch => {
-            let repo = open_repo()?;
-            let client = remote::Client::from_repo(&repo)?;
-            let manifest = remote::fetch_repo(&repo, &client)?;
-            println!("已获取远端引用");
-            print!("{}", manifest.render());
-        }
-        Command::Remote { command } => match command {
-            Some(RemoteCommand::Add { name, url }) => {
-                if name != "origin" {
-                    bail!("当前只使用 origin 这个远端名字");
-                }
-                let repo = open_repo()?;
-                repo.config_set("remote.origin.url", &url)?;
-                repo.config_set("branch.main.remote", "origin")?;
-                repo.config_set("branch.main.merge", "refs/heads/main")?;
-                println!("已添加 origin {url}");
-            }
-            Some(RemoteCommand::List) | None => {
-                let repo = open_repo()?;
-                match repo.config_get("remote.origin.url")? {
-                    Some(url) => println!("origin\t{url}"),
-                    None => println!("没有远端"),
-                }
-            }
-        },
         Command::Login { server, user } => {
             let password = identity::read_password("密码: ")?;
             let session = remote::login(&server, &user, &password)?;
@@ -385,9 +276,7 @@ pub fn execute() -> anyhow::Result<()> {
             runtime.block_on(crate::server::serve(data, &bind))?;
         }
         Command::Mcp { repo } => crate::mcp::serve(repo)?,
-        Command::RevParse { name } => {
-            println!("{}", open_repo()?.rev_parse(&name)?);
-        }
+        Command::Git(command) => porcelain::run(command)?,
     }
     Ok(())
 }
@@ -407,19 +296,30 @@ fn print_status(repo: &Repository) -> anyhow::Result<()> {
         (None, Some(oid)) => println!("HEAD 分离在 {}", oid.short()),
         _ => println!("还没有提交"),
     }
+    if let Some(kind) = repo.sequence_kind() {
+        let todo = repo.sequence_todo()?;
+        println!(
+            "正在进行 {kind}，还剩 {} 步；ait {kind} --continue / --skip / --abort",
+            todo.len()
+        );
+    } else if repo.merge_head()?.is_some() {
+        println!("正在合并；解决冲突后 ait add 再 ait commit，或 ait merge --abort");
+    }
     if let Some(branch) = &status.branch {
-        if let (Some(local), Some(remote)) = (
-            status.head,
-            repo.resolve_ref(&format!("refs/remotes/origin/{branch}"))?,
-        ) {
-            if local == remote {
-                println!("与 origin/{branch} 一致");
-            } else if repo.is_ancestor(remote, local)? {
-                println!("领先于 origin/{branch}");
-            } else if repo.is_ancestor(local, remote)? {
-                println!("落后于 origin/{branch}，可以 ait pull");
-            } else {
-                println!("与 origin/{branch} 已经分叉，ait pull 会尝试合并");
+        let upstream = repo
+            .upstream_of(branch)?
+            .unwrap_or_else(|| format!("refs/remotes/origin/{branch}"));
+        let label = upstream
+            .trim_start_matches("refs/remotes/")
+            .trim_start_matches("refs/heads/")
+            .to_string();
+        if let (Some(local), Some(remote)) = (status.head, repo.resolve_ref(&upstream)?) {
+            let (ahead, behind) = porcelain::ahead_behind(repo, local, remote)?;
+            match (ahead, behind) {
+                (0, 0) => println!("与 {label} 一致"),
+                (a, 0) => println!("领先于 {label} {a} 个提交"),
+                (0, b) => println!("落后于 {label} {b} 个提交，可以 ait pull"),
+                (a, b) => println!("与 {label} 已经分叉（领先 {a}，落后 {b}），ait pull 会尝试合并"),
             }
         }
     }
@@ -502,46 +402,6 @@ enum Command {
         #[arg(num_args = 0..)]
         paths: Vec<String>,
     },
-    /// 把路径从暂存区撤回到 HEAD 的版本；加 --worktree 时连工作区一起还原
-    Restore {
-        #[arg(required = true)]
-        paths: Vec<String>,
-        #[arg(long)]
-        worktree: bool,
-    },
-    /// 查看工作区状态和越权文件
-    Status,
-    /// 查看差异。默认是未暂存的修改
-    Diff {
-        #[arg(long)]
-        cached: bool,
-    },
-    /// 提交
-    Commit {
-        #[arg(short, long)]
-        message: String,
-        #[arg(short = 'a', long)]
-        all: bool,
-    },
-    /// 查看提交历史
-    Log {
-        #[arg(short = 'n', long, default_value_t = 20)]
-        max_count: usize,
-    },
-    /// 列出、创建或删除分支
-    Branch {
-        name: Option<String>,
-        #[arg(short = 'd', long)]
-        delete: bool,
-    },
-    /// 切换分支或提交
-    Checkout {
-        target: String,
-        #[arg(short = 'b')]
-        create: bool,
-    },
-    /// 切换分支
-    Switch { target: String },
     /// 合并分支或提交。默认行级三方合并
     Merge {
         branch: Option<String>,
@@ -560,20 +420,6 @@ enum Command {
         /// 冲突处理。`ours` 或 `theirs` 采用对应一侧的冲突块
         #[arg(short = 'X')]
         option: Vec<String>,
-    },
-    /// 推送到 origin。越权修改会变成评审，不会直接进入分支
-    Push {
-        #[arg(long)]
-        force: bool,
-    },
-    /// 拉取并合并，同时更新权限清单
-    Pull,
-    /// 只下载远端对象和权限清单
-    Fetch,
-    /// 查看或添加 origin
-    Remote {
-        #[command(subcommand)]
-        command: Option<RemoteCommand>,
     },
     /// 登录 ait 服务
     Login {
@@ -625,17 +471,8 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// 解析提交或分支
-    #[command(name = "rev-parse")]
-    RevParse { name: String },
-}
-
-#[derive(Subcommand)]
-enum RemoteCommand {
-    /// 添加 origin
-    Add { name: String, url: String },
-    /// 列出远端
-    List,
+    #[command(flatten)]
+    Git(porcelain::GitCommand),
 }
 
 #[derive(Subcommand)]

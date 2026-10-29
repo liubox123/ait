@@ -11,6 +11,7 @@ pub mod perm;
 pub mod plan;
 pub mod remote;
 pub mod server;
+pub mod smart;
 pub mod store;
 
 pub use git::Repository;

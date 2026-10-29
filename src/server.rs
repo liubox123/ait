@@ -63,6 +63,7 @@ pub fn router(store: Store) -> Router {
         .route("/api/git/:name/pull", post(git_pull))
         .route("/api/git/:name/push", post(git_push))
         .route("/r/:name", get(repo_redirect))
+        .merge(crate::smart::routes())
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(store)
 }

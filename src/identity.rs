@@ -86,9 +86,25 @@ pub fn signature_now(name: &str, email: &str) -> Signature {
 }
 
 pub fn format_time(timestamp: i64, tz: &str) -> String {
-    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+    let offset = tz_seconds(tz);
+    let local = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp + offset, 0)
         .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch"));
-    format!("{} {tz}", utc.format("%Y-%m-%d %H:%M:%S"))
+    format!("{} {tz}", local.format("%Y-%m-%d %H:%M:%S"))
+}
+
+/// `+0800` 这样的时区偏移换算成秒。
+fn tz_seconds(tz: &str) -> i64 {
+    let (sign, digits) = match tz.as_bytes().first() {
+        Some(b'-') => (-1, &tz[1..]),
+        Some(b'+') => (1, &tz[1..]),
+        _ => (1, tz),
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let hours: i64 = digits[..2].parse().unwrap_or(0);
+    let minutes: i64 = digits[2..].parse().unwrap_or(0);
+    sign * (hours * 3600 + minutes * 60)
 }
 
 #[derive(Clone, Debug)]

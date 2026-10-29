@@ -110,6 +110,60 @@ impl Commit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagObject {
+    pub object: Oid,
+    pub kind: String,
+    pub name: String,
+    pub tagger: Option<Signature>,
+    pub message: String,
+}
+
+impl TagObject {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = format!(
+            "object {}\ntype {}\ntag {}\n",
+            self.object, self.kind, self.name
+        );
+        if let Some(tagger) = &self.tagger {
+            body.push_str(&format!("tagger {}\n", tagger.format_line()));
+        }
+        body.push('\n');
+        body.push_str(&self.message);
+        if !self.message.is_empty() && !self.message.ends_with('\n') {
+            body.push('\n');
+        }
+        body.into_bytes()
+    }
+
+    pub fn parse(payload: &[u8]) -> anyhow::Result<Self> {
+        let text = String::from_utf8_lossy(payload);
+        let (header, message) = text.split_once("\n\n").unwrap_or((&text, ""));
+        let mut object = None;
+        let mut kind = None;
+        let mut name = String::new();
+        let mut tagger = None;
+        for line in header.lines() {
+            if let Some(rest) = line.strip_prefix("object ") {
+                object = Some(Oid::parse(rest.trim())?);
+            } else if let Some(rest) = line.strip_prefix("type ") {
+                kind = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("tag ") {
+                name = rest.trim().to_string();
+            } else if let Some(rest) = line.strip_prefix("tagger ") {
+                tagger = Signature::parse(rest).ok();
+            }
+        }
+        Ok(TagObject {
+            object: object.context("标签缺少 object")?,
+            kind: kind.context("标签缺少 type")?,
+            name,
+            tagger,
+            message: message.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),
     Tree(Vec<TreeEntry>),

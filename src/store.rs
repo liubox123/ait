@@ -20,6 +20,9 @@ use crate::identity::{
 use crate::perm::{Access, Duty, Manifest, Policy, Rule};
 use crate::plan::{self, Assignment};
 
+mod gitops;
+pub use gitops::RefCommand;
+
 #[derive(Clone, Debug)]
 pub struct ApiError {
     pub status: StatusCode,
@@ -212,6 +215,10 @@ pub struct PushRequest {
     pub objects: Vec<ObjectBody>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub pack_b64: Option<String>,
+    #[serde(skip)]
+    pub staged: Vec<(Oid, &'static str, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -258,6 +265,10 @@ pub struct RefInfo {
 pub struct RefsResponse {
     pub refs: Vec<RefInfo>,
     pub manifest: Manifest,
+    #[serde(default)]
+    pub tags: Vec<RefInfo>,
+    #[serde(default)]
+    pub head: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,7 +400,8 @@ impl Store {
         let _guard = self.lock();
         let mut tokens = self.tokens()?;
         tokens.remove(&token_id(token));
-        self.save_tokens(&tokens)
+        self.save_tokens(&tokens)?;
+        self.forget_token_time(token)
     }
 
     pub fn authenticate(&self, token: &str) -> Result<AuthSession, ApiError> {
@@ -398,6 +410,12 @@ impl Store {
         let Some(name) = tokens.get(&token_id(token)) else {
             return Err(ApiError::unauthorized("登录已失效"));
         };
+        let name = name.clone();
+        let name = &name;
+        if self.token_expired(token)? {
+            self.drop_token(token)?;
+            return Err(ApiError::unauthorized("登录已过期，请重新登录"));
+        }
         let users = self.users()?;
         let Some(user) = users.iter().find(|user| &user.name == name) else {
             return Err(ApiError::unauthorized("用户不存在"));
@@ -424,6 +442,7 @@ impl Store {
         let token = random_token();
         tokens.insert(token_id(&token), name.to_string());
         self.save_tokens(&tokens)?;
+        self.note_token_issued(&token)?;
         Ok(AuthSession {
             token,
             user: name.to_string(),
@@ -727,7 +746,19 @@ impl Store {
             .into_iter()
             .map(|(name, oid)| RefInfo { name, oid })
             .collect();
-        Ok(RefsResponse { refs, manifest })
+        let tags = repo
+            .list_refs("refs/tags/")
+            .map_err(git_err)?
+            .into_iter()
+            .map(|(name, oid)| RefInfo { name, oid })
+            .collect();
+        let head = self.head_branch(name)?;
+        Ok(RefsResponse {
+            refs,
+            manifest,
+            tags,
+            head,
+        })
     }
 
     pub fn pull(
@@ -777,14 +808,17 @@ impl Store {
         request: PushRequest,
     ) -> Result<PushResponse, ApiError> {
         let _guard = self.lock();
+        if request.reference.starts_with("refs/tags/") {
+            return self.push_tag_locked(name, user, admin, &request);
+        }
         if request.new_oid.is_zero() {
-            return Err(ApiError::bad("不能推送空提交"));
+            return self.delete_branch_locked(name, user, admin, &request);
         }
         let reference = normalize_branch(&request.reference)?;
         let repo = self.open_git(name)?;
         let policy = self.policy_of(name)?;
         let owner = policy.is_owner(user, admin);
-        let protected = is_protected(&reference);
+        let protected = self.protected_branch(name, &reference);
         let mut branch_owners = self.branch_owners(name)?;
         let creator = branch_owners.get(&reference).cloned();
         if !protected {
@@ -810,12 +844,7 @@ impl Store {
                 "远端 {reference} 已是 {current}，请先拉取"
             )));
         }
-        for object in &request.objects {
-            let bytes = STANDARD
-                .decode(object.payload_b64.trim())
-                .map_err(|_| ApiError::bad("对象内容不是合法的 base64"))?;
-            repo.ingest(&object.kind, &bytes).map_err(git_err)?;
-        }
+        self.stage_request(&repo, &request)?;
         ensure_complete(&repo, request.new_oid)?;
         if !current.is_zero() && current != request.new_oid && !(request.force && can_force) {
             let fast_forward = repo
@@ -855,6 +884,7 @@ impl Store {
                 denied.join(", ")
             )));
         }
+        repo.persist_staged().map_err(git_err)?;
         if !protected {
             repo.set_ref(&reference, request.new_oid).map_err(git_err)?;
             if creator.is_none() {
@@ -1580,7 +1610,12 @@ fn ensure_complete(repo: &Repository, oid: Oid) -> Result<(), ApiError> {
                     stack.push(entry.oid);
                 }
             }
-            Ok(Object::Blob(_) | Object::Tag(_)) => {}
+            Ok(Object::Tag(payload)) => {
+                let tag = crate::git::TagObject::parse(&payload)
+                    .map_err(|_| ApiError::bad(format!("标签对象 {oid} 无法解析")))?;
+                stack.push(tag.object);
+            }
+            Ok(Object::Blob(_)) => {}
             Err(_) => return Err(ApiError::bad(format!("缺少对象 {oid}，请重新推送完整历史"))),
         }
     }
@@ -1599,10 +1634,6 @@ pub fn normalize_branch(reference: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad(format!("非法分支名: {name}")));
     }
     Ok(format!("refs/heads/{name}"))
-}
-
-fn is_protected(reference: &str) -> bool {
-    matches!(short_ref(reference), "main" | "master")
 }
 
 fn short_ref(reference: &str) -> &str {
