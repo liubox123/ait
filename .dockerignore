@@ -1,0 +1,5 @@
+.git
+target
+ait-data
+*.swp
+.DS_Store

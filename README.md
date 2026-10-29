@@ -41,7 +41,15 @@ cd shop
 ait plan apply --file ../examples/shop.plan.md
 ```
 
-The password is read from `AIT_PASSWORD`, or from the terminal. Set the commit identity with `ait config user.name` and `ait config user.email`, or with `AIT_AUTHOR_NAME` / `AIT_AUTHOR_EMAIL`. The first registered user is the administrator.
+The password is read from `AIT_PASSWORD`, or from the terminal. Set the commit identity with `ait config user.name` and `ait config user.email`, or with `AIT_AUTHOR_NAME` / `AIT_AUTHOR_EMAIL`. The first registered user is the administrator. Passwords are stored as Argon2id. Set `AIT_ALLOW_REGISTER=false` to stop later registrations.
+
+## Docker
+
+```bash
+docker compose up -d --build
+```
+
+The page listens on `http://127.0.0.1:7878`. Repository data stays in the `ait-data` volume. After the administrator account exists, set `AIT_ALLOW_REGISTER=false` in `docker-compose.yml` and start the container again.
 
 ## Commands
 
@@ -98,7 +106,7 @@ The HTTP call is `PUT /api/repos/:name/plan` with `{ "content", "apply", "use_ll
 
 ## MCP
 
-Run `ait mcp` in the repository. Cursor configuration:
+Run `ait mcp` in the repository. This repository's `.cursor/mcp.json` registers that server for Cursor. The same configuration is:
 
 ```json
 {

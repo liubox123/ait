@@ -1,0 +1,14 @@
+services:
+  ait:
+    build: .
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - ait-data:/data
+    environment:
+      AIT_BIND: 0.0.0.0:7878
+      AIT_ALLOW_REGISTER: "true"
+    restart: unless-stopped
+
+volumes:
+  ait-data:

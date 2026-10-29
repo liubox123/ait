@@ -41,7 +41,15 @@ cd shop
 ait plan apply --file ../examples/shop.plan.md
 ```
 
-密码从 `AIT_PASSWORD` 读取，否则从终端读取。提交身份用 `ait config user.name` 和 `ait config user.email`，也可以用 `AIT_AUTHOR_NAME` / `AIT_AUTHOR_EMAIL`。第一个注册的用户是管理员。
+密码从 `AIT_PASSWORD` 读取，否则从终端读取。提交身份用 `ait config user.name` 和 `ait config user.email`，也可以用 `AIT_AUTHOR_NAME` / `AIT_AUTHOR_EMAIL`。第一个注册的用户是管理员。口令以 Argon2id 保存。管理员建好之后，把 `AIT_ALLOW_REGISTER=false` 设上，就不再接受新的注册。
+
+## Docker
+
+```bash
+docker compose up -d --build
+```
+
+页面在 `http://127.0.0.1:7878`。仓库数据放在名为 `ait-data` 的卷里。管理员账号建好后，在 `docker-compose.yml` 里把 `AIT_ALLOW_REGISTER` 设为 `false`，再启动一次容器。
 
 ## 命令
 
@@ -98,7 +106,7 @@ ait pr close pr-1a2b3c4d
 
 ## MCP
 
-在仓库目录启动 `ait mcp`。Cursor 配置：
+在仓库目录启动 `ait mcp`。本仓库的 `.cursor/mcp.json` 会向 Cursor 注册这个服务。等价配置是：
 
 ```json
 {
