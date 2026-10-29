@@ -6,8 +6,11 @@ use anyhow::{bail, Context};
 
 use super::diff::{diff_bytes, ChangeKind, FileDiff, PathChange};
 use super::ignore::Ignore;
-use super::index::{self, Index, IndexEntry};
-use super::merge::{merge_maps, FileMap, MergeAction};
+use super::index::{self, FileStat, Index, IndexEntry};
+use super::merge::{
+    adjust_renames, directory_file_conflicts, merge_maps, merge_mode, merge_text, FileMap,
+    MergeAction, TextOptions,
+};
 use super::object::{
     hash_payload, Commit, Object, Signature, TreeEntry, MODE_EXEC, MODE_LINK, MODE_TREE,
 };
@@ -70,6 +73,27 @@ pub struct StoredObject {
     pub oid: Oid,
     pub kind: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MergeOptions {
+    pub no_ff: bool,
+    pub ff_only: bool,
+    pub strategy_ours: bool,
+    pub favor: i8,
+    pub diff3: bool,
+}
+
+struct MergedTree {
+    files: FileMap,
+    conflicts: Vec<String>,
+    stages: BTreeMap<String, [Option<(u32, Oid)>; 3]>,
+}
+
+struct ResolvedBlob {
+    mode: u32,
+    oid: Oid,
+    conflict: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -580,6 +604,11 @@ impl Repository {
     }
 
     pub fn merge_base(&self, left: Oid, right: Oid) -> anyhow::Result<Option<Oid>> {
+        Ok(self.best_merge_bases(left, right)?.into_iter().next())
+    }
+
+    /// 所有最佳合并基。交叉合并时会多于一个，之后要先合成虚拟祖先。
+    pub fn best_merge_bases(&self, left: Oid, right: Oid) -> anyhow::Result<Vec<Oid>> {
         let mut ancestors = HashSet::new();
         let mut queue = VecDeque::from([left]);
         while let Some(oid) = queue.pop_front() {
@@ -590,20 +619,31 @@ impl Repository {
                 queue.extend(commit.parents);
             }
         }
-        let mut queue = VecDeque::from([right]);
+        let mut found = Vec::new();
         let mut seen = HashSet::new();
+        let mut queue = VecDeque::from([right]);
         while let Some(oid) = queue.pop_front() {
             if !seen.insert(oid) {
                 continue;
             }
             if ancestors.contains(&oid) {
-                return Ok(Some(oid));
+                found.push(oid);
+                continue;
             }
             if let Ok(Object::Commit(commit)) = self.read_object(oid) {
                 queue.extend(commit.parents);
             }
         }
-        Ok(None)
+        let mut best = Vec::new();
+        for oid in &found {
+            let dominated = found
+                .iter()
+                .any(|other| other != oid && self.is_ancestor(*oid, *other).unwrap_or(false));
+            if !dominated {
+                best.push(*oid);
+            }
+        }
+        Ok(best)
     }
 
     /// 把 `theirs` 合进 `ours`，不修改工作区。快进时不产生新提交。
@@ -620,29 +660,20 @@ impl Repository {
         if self.is_ancestor(ours, theirs)? {
             return Ok(MergeOutcome::FastForward(theirs));
         }
-        let base_files = match self.merge_base(ours, theirs)? {
-            Some(base) => self.files_of_commit(Some(base))?,
-            None => FileMap::new(),
-        };
+        let base_files = self.base_files_for(ours, theirs)?;
         let our_files = self.files_of_commit(Some(ours))?;
         let their_files = self.files_of_commit(Some(theirs))?;
-        let actions = merge_maps(&base_files, &our_files, &their_files);
-        let mut files = FileMap::new();
-        let mut conflicts = Vec::new();
-        for (path, action) in actions {
-            match action {
-                MergeAction::Take(mode, oid) => {
-                    files.insert(path, (mode, oid));
-                }
-                MergeAction::Delete => {}
-                MergeAction::Conflict { .. } => conflicts.push(path),
-            }
+        let merged = self.merge_file_maps(
+            &base_files,
+            &our_files,
+            &their_files,
+            "theirs",
+            &TextOptions::default(),
+        )?;
+        if !merged.conflicts.is_empty() {
+            return Ok(MergeOutcome::Conflicts(merged.conflicts));
         }
-        if !conflicts.is_empty() {
-            conflicts.sort();
-            return Ok(MergeOutcome::Conflicts(conflicts));
-        }
-        let tree = self.write_tree(&files)?;
+        let tree = self.write_tree(&merged.files)?;
         let commit = Commit {
             tree,
             parents: vec![ours, theirs],
@@ -705,7 +736,17 @@ impl Repository {
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
+        let mut seen_unmerged = BTreeSet::new();
         for entry in &index.entries {
+            if entry.stage > 0 {
+                if seen_unmerged.insert(entry.path.clone()) {
+                    staged.push(StatusEntry {
+                        path: entry.path.clone(),
+                        kind: ChangeKind::Unmerged,
+                    });
+                }
+                continue;
+            }
             match head_files.get(&entry.path) {
                 None => staged.push(StatusEntry {
                     path: entry.path.clone(),
@@ -784,7 +825,8 @@ impl Repository {
                 bail!("路径不存在: {rel}");
             }
         }
-        self.write_index_file(&index)
+        self.write_index_file(&index)?;
+        self.forget_conflicts(&specs)
     }
 
     pub fn commit(&self, message: &str, all: bool, author: &Signature) -> anyhow::Result<Oid> {
@@ -796,6 +838,10 @@ impl Repository {
             let marked = self.find_conflict_markers()?;
             if !marked.is_empty() {
                 bail!("仍有冲突标记: {}", marked.join(", "));
+            }
+            let pending = self.read_conflict_list()?;
+            if !pending.is_empty() {
+                bail!("仍有未解决的冲突: {}", pending.join(", "));
             }
         }
         if all {
@@ -895,6 +941,18 @@ impl Repository {
         label: &str,
         author: &Signature,
     ) -> anyhow::Result<MergeOutcome> {
+        self.merge_with(theirs, label, author, &MergeOptions::default())
+    }
+
+    /// `no_ff` 即使可以快进也生成合并提交。`ff_only` 在需要真正合并时拒绝。
+    /// `strategy_ours` 保留当前树。`favor` 为 1 或 -1 时，冲突块分别采用当前侧或并入侧。
+    pub fn merge_with(
+        &self,
+        theirs: Oid,
+        label: &str,
+        author: &Signature,
+        options: &MergeOptions,
+    ) -> anyhow::Result<MergeOutcome> {
         let Some(ours) = self.head_oid()? else {
             let commit = self.read_commit(theirs)?;
             self.checkout_files(&self.tree_files(commit.tree)?)?;
@@ -907,7 +965,16 @@ impl Repository {
         if ours == theirs || self.is_ancestor(theirs, ours)? {
             return Ok(MergeOutcome::UpToDate);
         }
+        if options.strategy_ours {
+            self.require_clean()?;
+            return self.write_merge_commit(ours, theirs, label, author);
+        }
         if self.is_ancestor(ours, theirs)? {
+            if options.no_ff {
+                self.require_clean()?;
+                self.switch_to(theirs)?;
+                return self.write_merge_commit(ours, theirs, label, author);
+            }
             self.switch_to(theirs)?;
             match self.head()? {
                 Head::Symbolic(name) => self.set_ref(&name, theirs)?,
@@ -915,91 +982,348 @@ impl Repository {
             }
             return Ok(MergeOutcome::FastForward(theirs));
         }
+        if options.ff_only {
+            bail!("不是快进，已拒绝合并");
+        }
         self.require_clean()?;
-        let base_files = match self.merge_base(ours, theirs)? {
-            Some(base) => self.tree_files(self.read_commit(base)?.tree)?,
-            None => FileMap::new(),
+        atomic_write(
+            &self.git_dir.join("ORIG_HEAD"),
+            format!("{ours}\n").as_bytes(),
+        )?;
+        let bases = self.best_merge_bases(ours, theirs)?;
+        let base_label = if bases.len() == 1 {
+            bases[0].short()
+        } else {
+            "merged common ancestors".to_string()
         };
+        let base_files = self.combine_bases(&bases)?;
         let our_files = self.tree_files(self.read_commit(ours)?.tree)?;
         let their_files = self.tree_files(self.read_commit(theirs)?.tree)?;
-        let actions = merge_maps(&base_files, &our_files, &their_files);
-        for (path, action) in &actions {
-            if let MergeAction::Take(mode, oid) = action {
-                if !our_files.contains_key(path) {
-                    let disk = self.work_path(path)?;
-                    if fs::symlink_metadata(&disk).is_ok() {
-                        let (have_mode, have_oid) = self.hash_work(path)?;
-                        if have_mode != *mode || have_oid != *oid {
-                            bail!("未跟踪文件会被覆盖: {path}");
-                        }
-                    }
+        for (path, (mode, oid)) in &their_files {
+            if our_files.contains_key(path) {
+                continue;
+            }
+            let disk = self.work_path(path)?;
+            if fs::symlink_metadata(&disk).is_ok() {
+                let (have_mode, have_oid) = self.hash_work(path)?;
+                if have_mode != *mode || have_oid != *oid {
+                    bail!("未跟踪文件会被覆盖: {path}");
                 }
             }
         }
-        let mut conflicts = Vec::new();
-        let mut result = FileMap::new();
-        for (path, action) in &actions {
-            match action {
-                MergeAction::Take(mode, oid) => {
-                    self.materialize(path, *mode, *oid)?;
-                    result.insert(path.clone(), (*mode, *oid));
-                }
-                MergeAction::Delete => {
-                    let disk = self.work_path(path)?;
-                    if fs::symlink_metadata(&disk).is_ok() {
-                        let _ = fs::remove_file(disk);
-                    }
-                }
-                MergeAction::Conflict {
-                    ours: our_side,
-                    theirs: their_side,
-                } => {
-                    conflicts.push(path.clone());
-                    let bytes = self.conflict_blob(label, *our_side, *their_side)?;
-                    let disk = self.work_path(path)?;
-                    if let Some(parent) = disk.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    if fs::symlink_metadata(&disk).is_ok() {
-                        let _ = fs::remove_file(&disk);
-                    }
-                    fs::write(disk, bytes)?;
-                }
-            }
+        let mut text = TextOptions {
+            diff3: options.diff3,
+            favor: options.favor,
+            base_label,
+        };
+        if !text.diff3 && self.config_get("merge.conflictStyle")?.as_deref() == Some("diff3") {
+            text.diff3 = true;
         }
+        let merged = self.merge_file_maps(&base_files, &our_files, &their_files, label, &text)?;
         for path in our_files.keys() {
-            if !result.contains_key(path) && !conflicts.iter().any(|item| item == path) {
+            if !merged.files.contains_key(path) && !merged.conflicts.iter().any(|item| item == path)
+            {
                 let disk = self.work_path(path)?;
                 if fs::symlink_metadata(&disk).is_ok() {
                     let _ = fs::remove_file(disk);
                 }
             }
         }
-        self.write_index_from_map(&result)?;
-        if conflicts.is_empty() {
-            let tree = self.write_tree(&result)?;
-            let commit = Commit {
-                tree,
-                parents: vec![ours, theirs],
-                author: author.clone(),
-                committer: author.clone(),
-                message: format!("Merge {label}\n"),
-            };
-            let oid = self.write_object("commit", &commit.encode())?;
-            match self.head()? {
-                Head::Symbolic(name) => self.set_ref(&name, oid)?,
-                Head::Detached(_) => self.set_head_detached(oid)?,
-            }
-            Ok(MergeOutcome::Merged(oid))
+        self.checkout_files(&merged.files)?;
+        if merged.conflicts.is_empty() {
+            self.write_merge_commit(ours, theirs, label, author)
         } else {
+            self.write_unmerged_index(&merged)?;
+            let message = format!("Merge {label}\n");
             fs::create_dir_all(self.git_dir.join("ait"))?;
-            fs::write(self.git_dir.join("ait/MERGE_HEAD"), format!("{theirs}\n"))?;
-            fs::write(
-                self.git_dir.join("ait/MERGE_MSG"),
-                format!("Merge {label}\n"),
+            atomic_write(
+                &self.git_dir.join("MERGE_HEAD"),
+                format!("{theirs}\n").as_bytes(),
             )?;
-            Ok(MergeOutcome::Conflicts(conflicts))
+            atomic_write(&self.git_dir.join("MERGE_MSG"), message.as_bytes())?;
+            atomic_write(
+                &self.git_dir.join("ait/MERGE_HEAD"),
+                format!("{theirs}\n").as_bytes(),
+            )?;
+            atomic_write(&self.git_dir.join("ait/MERGE_MSG"), message.as_bytes())?;
+            self.write_conflict_list(&merged.conflicts)?;
+            Ok(MergeOutcome::Conflicts(merged.conflicts))
         }
+    }
+
+    pub fn merge_abort(&self) -> anyhow::Result<()> {
+        if self.merge_head()?.is_none() {
+            bail!("没有进行中的合并");
+        }
+        let oid = self.head_oid()?.context("没有当前提交")?;
+        let files = self.tree_files(self.read_commit(oid)?.tree)?;
+        let index = self.read_index()?;
+        for entry in &index.entries {
+            if !files.contains_key(&entry.path) {
+                let disk = self.work_path(&entry.path)?;
+                if fs::symlink_metadata(&disk).is_ok() {
+                    let _ = fs::remove_file(disk);
+                }
+            }
+        }
+        self.checkout_files(&files)?;
+        self.clear_merge()?;
+        Ok(())
+    }
+
+    fn write_merge_commit(
+        &self,
+        ours: Oid,
+        theirs: Oid,
+        label: &str,
+        author: &Signature,
+    ) -> anyhow::Result<MergeOutcome> {
+        let tree = self.write_tree(&index_map(&self.read_index()?))?;
+        let commit = Commit {
+            tree,
+            parents: vec![ours, theirs],
+            author: author.clone(),
+            committer: author.clone(),
+            message: format!("Merge {label}\n"),
+        };
+        let oid = self.write_object("commit", &commit.encode())?;
+        match self.head()? {
+            Head::Symbolic(name) => self.set_ref(&name, oid)?,
+            Head::Detached(_) => self.set_head_detached(oid)?,
+        }
+        self.clear_merge()?;
+        Ok(MergeOutcome::Merged(oid))
+    }
+
+    fn base_files_for(&self, left: Oid, right: Oid) -> anyhow::Result<FileMap> {
+        let bases = self.best_merge_bases(left, right)?;
+        self.combine_bases(&bases)
+    }
+
+    fn combine_bases(&self, bases: &[Oid]) -> anyhow::Result<FileMap> {
+        if bases.is_empty() {
+            return Ok(FileMap::new());
+        }
+        let mut files = self.files_of_commit(Some(bases[0]))?;
+        let mut current = bases[0];
+        for (index, next) in bases.iter().enumerate().skip(1) {
+            let ancestor = self.base_files_for(current, *next)?;
+            let right = self.files_of_commit(Some(*next))?;
+            files = self
+                .merge_file_maps(
+                    &ancestor,
+                    &files,
+                    &right,
+                    "merge-base",
+                    &TextOptions::default(),
+                )?
+                .files;
+            if index + 1 < bases.len() {
+                current = self.virtual_commit(&files, vec![current, *next])?;
+            }
+        }
+        Ok(files)
+    }
+
+    fn virtual_commit(&self, files: &FileMap, parents: Vec<Oid>) -> anyhow::Result<Oid> {
+        let tree = self.write_tree(files)?;
+        let author = Signature {
+            name: "ait".into(),
+            email: "ait@local".into(),
+            time: 0,
+            tz: "+0000".into(),
+        };
+        let commit = Commit {
+            tree,
+            parents,
+            author: author.clone(),
+            committer: author,
+            message: "virtual merge base\n".into(),
+        };
+        self.write_object("commit", &commit.encode())
+    }
+
+    fn merge_file_maps(
+        &self,
+        base: &FileMap,
+        ours: &FileMap,
+        theirs: &FileMap,
+        label: &str,
+        options: &TextOptions,
+    ) -> anyhow::Result<MergedTree> {
+        let mut base = base.clone();
+        let mut ours = ours.clone();
+        let mut theirs = theirs.clone();
+        let mut conflicts = adjust_renames(&mut base, &mut ours, &mut theirs, &|oid| {
+            self.read_blob(oid).unwrap_or_default()
+        });
+        let actions = merge_maps(&base, &ours, &theirs);
+        let mut files = FileMap::new();
+        let mut stages = BTreeMap::new();
+        for (path, action) in actions {
+            match action {
+                MergeAction::Take(mode, oid) => {
+                    files.insert(path, (mode, oid));
+                }
+                MergeAction::Delete => {}
+                MergeAction::Conflict {
+                    ours: our_side,
+                    theirs: their_side,
+                } => {
+                    stages.insert(
+                        path.clone(),
+                        [base.get(&path).copied(), our_side, their_side],
+                    );
+                    if let Some(resolved) =
+                        self.resolve_content(&path, &base, our_side, their_side, label, options)?
+                    {
+                        if resolved.conflict {
+                            conflicts.push(path.clone());
+                        } else {
+                            stages.remove(&path);
+                        }
+                        files.insert(path, (resolved.mode, resolved.oid));
+                    } else if our_side.is_some() || their_side.is_some() {
+                        conflicts.push(path);
+                    }
+                }
+            }
+        }
+        for path in directory_file_conflicts(&files) {
+            if let Some(entry) = files.remove(&path) {
+                files.insert(format!("{path}~HEAD"), entry);
+            }
+            conflicts.push(path);
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        Ok(MergedTree {
+            files,
+            conflicts,
+            stages,
+        })
+    }
+
+    fn resolve_content(
+        &self,
+        path: &str,
+        base: &FileMap,
+        ours: Option<(u32, Oid)>,
+        theirs: Option<(u32, Oid)>,
+        label: &str,
+        options: &TextOptions,
+    ) -> anyhow::Result<Option<ResolvedBlob>> {
+        let base_entry = base.get(path).copied();
+        match (ours, theirs) {
+            (Some(our), Some(their)) => {
+                let base_bytes = match base_entry {
+                    Some((_, oid)) => self.read_blob(oid)?,
+                    None => Vec::new(),
+                };
+                let our_bytes = self.read_blob(our.1)?;
+                let their_bytes = self.read_blob(their.1)?;
+                let merged = merge_text(
+                    &base_bytes,
+                    &our_bytes,
+                    &their_bytes,
+                    "HEAD",
+                    label,
+                    options,
+                );
+                let (mode, mode_conflict) =
+                    merge_mode(base_entry.map(|item| item.0), Some(our.0), Some(their.0));
+                let oid = if merged.bytes == our_bytes {
+                    our.1
+                } else if merged.bytes == their_bytes {
+                    their.1
+                } else if base_entry.is_some_and(|(_, oid)| {
+                    self.read_blob(oid).ok().as_deref() == Some(merged.bytes.as_slice())
+                }) {
+                    base_entry.unwrap().1
+                } else {
+                    self.write_object("blob", &merged.bytes)?
+                };
+                Ok(Some(ResolvedBlob {
+                    mode,
+                    oid,
+                    conflict: merged.conflict || mode_conflict,
+                }))
+            }
+            (Some(side), None) | (None, Some(side)) => Ok(Some(ResolvedBlob {
+                mode: side.0,
+                oid: side.1,
+                conflict: true,
+            })),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn write_unmerged_index(&self, merged: &MergedTree) -> anyhow::Result<()> {
+        let mut index = self.read_index()?;
+        for path in &merged.conflicts {
+            let Some(sides) = merged.stages.get(path) else {
+                continue;
+            };
+            index.remove(path);
+            for (stage, side) in [(1u16, sides[0]), (2, sides[1]), (3, sides[2])] {
+                let Some((mode, oid)) = side else {
+                    continue;
+                };
+                index.upsert(IndexEntry {
+                    path: path.clone(),
+                    mode,
+                    oid,
+                    stat: FileStat::default(),
+                    stage,
+                });
+            }
+        }
+        self.write_index_file(&index)
+    }
+
+    fn write_conflict_list(&self, paths: &[String]) -> anyhow::Result<()> {
+        let path = self.git_dir.join("ait/MERGE_CONFLICTS");
+        if paths.is_empty() {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            return Ok(());
+        }
+        fs::create_dir_all(self.git_dir.join("ait"))?;
+        atomic_write(&path, format!("{}\n", paths.join("\n")).as_bytes())
+    }
+
+    fn read_conflict_list(&self) -> anyhow::Result<Vec<String>> {
+        let path = self.git_dir.join("ait/MERGE_CONFLICTS");
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(fs::read_to_string(path)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    fn forget_conflicts(&self, specs: &[String]) -> anyhow::Result<()> {
+        let pending = self.read_conflict_list()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut matched = Vec::new();
+        for spec in specs {
+            matched.push(self.resolve_spec(spec).unwrap_or_default());
+        }
+        let left: Vec<String> = pending
+            .into_iter()
+            .filter(|path| {
+                !matched.iter().any(|spec| {
+                    spec.is_empty() || spec == path || path.starts_with(&format!("{spec}/"))
+                })
+            })
+            .collect();
+        self.write_conflict_list(&left)
     }
 
     pub fn config_get(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -1112,6 +1436,7 @@ impl Repository {
                 mode: *mode,
                 oid: *oid,
                 stat,
+                stage: 0,
             });
         }
         self.write_index_file(&index)
@@ -1142,8 +1467,15 @@ impl Repository {
                 .map(|entry| entry.path.clone())
                 .collect();
             for path in tracked {
-                if fs::symlink_metadata(self.work_path(&path)?).is_err() {
-                    index.remove(&path);
+                let disk = self.work_path(&path)?;
+                match fs::symlink_metadata(&disk) {
+                    Ok(meta) if meta.is_dir() => {
+                        index.remove(&path);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        index.remove(&path);
+                    }
                 }
             }
         } else {
@@ -1160,11 +1492,13 @@ impl Repository {
         let (mode, stat) = index::stat_path(&disk)?;
         let bytes = read_disk(&disk, mode)?;
         let oid = self.write_object("blob", &bytes)?;
+        index.remove(rel);
         index.upsert(IndexEntry {
             path: rel.to_string(),
             mode,
             oid,
             stat,
+            stage: 0,
         });
         Ok(())
     }
@@ -1428,16 +1762,24 @@ impl Repository {
     }
 
     fn merge_head(&self) -> anyhow::Result<Option<Oid>> {
-        let path = self.git_dir.join("ait/MERGE_HEAD");
-        if !path.is_file() {
-            return Ok(None);
+        for name in ["MERGE_HEAD", "ait/MERGE_HEAD"] {
+            let path = self.git_dir.join(name);
+            if path.is_file() {
+                let text = fs::read_to_string(path)?;
+                return Ok(Some(Oid::parse(text.trim())?));
+            }
         }
-        let text = fs::read_to_string(path)?;
-        Ok(Some(Oid::parse(text.trim())?))
+        Ok(None)
     }
 
     fn clear_merge(&self) -> anyhow::Result<()> {
-        for name in ["ait/MERGE_HEAD", "ait/MERGE_MSG"] {
+        for name in [
+            "MERGE_HEAD",
+            "MERGE_MSG",
+            "ait/MERGE_HEAD",
+            "ait/MERGE_MSG",
+            "ait/MERGE_CONFLICTS",
+        ] {
             let path = self.git_dir.join(name);
             if path.exists() {
                 fs::remove_file(path)?;
@@ -1462,24 +1804,6 @@ impl Repository {
             }
         }
         Ok(found)
-    }
-
-    fn conflict_blob(
-        &self,
-        label: &str,
-        ours: Option<(u32, Oid)>,
-        theirs: Option<(u32, Oid)>,
-    ) -> anyhow::Result<Vec<u8>> {
-        let mut out = b"<<<<<<< HEAD\n".to_vec();
-        if let Some((_, oid)) = ours {
-            push_with_newline(&mut out, &self.read_blob(oid)?);
-        }
-        out.extend_from_slice(b"=======\n");
-        if let Some((_, oid)) = theirs {
-            push_with_newline(&mut out, &self.read_blob(oid)?);
-        }
-        out.extend_from_slice(format!(">>>>>>> {label}\n").as_bytes());
-        Ok(out)
     }
 
     fn mark_reachable(&self, start: Oid, out: &mut HashSet<Oid>) -> anyhow::Result<()> {
@@ -1651,13 +1975,6 @@ fn path_changes(old: &FileMap, new: &FileMap) -> Vec<PathChange> {
         }
     }
     out
-}
-
-fn push_with_newline(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(bytes);
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-        out.push(b'\n');
-    }
 }
 
 fn read_disk(path: &Path, mode: u32) -> anyhow::Result<Vec<u8>> {

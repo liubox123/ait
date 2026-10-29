@@ -26,6 +26,8 @@ pub struct IndexEntry {
     pub mode: u32,
     pub oid: Oid,
     pub stat: FileStat,
+    /// 0 是普通项。合并冲突时 1 是祖先，2 是当前侧，3 是并入侧。
+    pub stage: u16,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,17 +37,28 @@ pub struct Index {
 
 impl Index {
     pub fn get(&self, path: &str) -> Option<&IndexEntry> {
-        self.entries.iter().find(|e| e.path == path)
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path && entry.stage == 0)
+            .or_else(|| self.entries.iter().find(|entry| entry.path == path))
     }
 
     pub fn upsert(&mut self, entry: IndexEntry) {
-        if let Some(pos) = self.entries.iter().position(|e| e.path == entry.path) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|item| item.path == entry.path && item.stage == entry.stage)
+        {
             self.entries[pos] = entry;
         } else {
             self.entries.push(entry);
         }
-        self.entries
-            .sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        self.entries.sort_by(|a, b| {
+            a.path
+                .as_bytes()
+                .cmp(b.path.as_bytes())
+                .then(a.stage.cmp(&b.stage))
+        });
     }
 
     pub fn remove(&mut self, path: &str) -> bool {
@@ -103,6 +116,7 @@ pub fn read_index(bytes: &[u8]) -> anyhow::Result<Index> {
         let mut oid = [0u8; 20];
         oid.copy_from_slice(&bytes[offset + 40..offset + 60]);
         let flags = u16::from_be_bytes(bytes[offset + 60..offset + 62].try_into().unwrap());
+        let stage = (flags >> 12) & 0x3;
         let extended = flags & 0x4000 != 0;
         let mut name_off = offset + 62;
         if extended {
@@ -131,6 +145,7 @@ pub fn read_index(bytes: &[u8]) -> anyhow::Result<Index> {
             mode,
             oid: Oid(oid),
             stat,
+            stage,
         });
     }
     Ok(Index { entries })
@@ -138,7 +153,12 @@ pub fn read_index(bytes: &[u8]) -> anyhow::Result<Index> {
 
 pub fn write_index(index: &Index) -> Vec<u8> {
     let mut entries = index.entries.clone();
-    entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    entries.sort_by(|a, b| {
+        a.path
+            .as_bytes()
+            .cmp(b.path.as_bytes())
+            .then(a.stage.cmp(&b.stage))
+    });
     let mut buf = Vec::new();
     buf.extend_from_slice(b"DIRC");
     buf.extend_from_slice(&2u32.to_be_bytes());
@@ -159,7 +179,7 @@ pub fn write_index(index: &Index) -> Vec<u8> {
         put_u32(&mut buf, start + 32, entry.stat.gid);
         put_u32(&mut buf, start + 36, entry.stat.size);
         buf[start + 40..start + 60].copy_from_slice(&entry.oid.0);
-        let flag = name.len().min(0x0fff) as u16;
+        let flag = ((entry.stage & 0x3) << 12) | name.len().min(0x0fff) as u16;
         buf[start + 60..start + 62].copy_from_slice(&flag.to_be_bytes());
         buf[start + 62..start + 62 + name.len()].copy_from_slice(name);
     }
@@ -256,6 +276,7 @@ mod tests {
                     mtime_s: 10,
                     ..FileStat::default()
                 },
+                stage: 0,
             }],
         };
         let bytes = write_index(&index);

@@ -17,7 +17,7 @@ pub use object::{
     Commit, Object, Signature, TreeEntry, MODE_BLOB, MODE_EXEC, MODE_LINK, MODE_TREE,
 };
 pub use oid::Oid;
-pub use repo::{valid_branch, Head, MergeOutcome, Repository, Status, StatusEntry};
+pub use repo::{valid_branch, Head, MergeOptions, MergeOutcome, Repository, Status, StatusEntry};
 
 pub fn empty_tree_oid() -> Oid {
     object::hash_payload("tree", &[]).0

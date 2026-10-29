@@ -537,15 +537,43 @@ fn token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 fn base_url(headers: &HeaderMap) -> String {
     if let Ok(url) = std::env::var("AIT_PUBLIC_URL") {
-        return url.trim_end_matches('/').to_string();
+        let url = url.trim().trim_end_matches('/').to_string();
+        if (url.starts_with("http://") || url.starts_with("https://")) && safe_public_url(&url) {
+            return url;
+        }
     }
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
+        .filter(|host| safe_host(host))
         .unwrap_or("127.0.0.1:7878");
     let proto = headers
         .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("http");
+        .and_then(|value| value.to_str().ok());
+    let proto = if proto.is_some_and(|value| value.eq_ignore_ascii_case("https")) {
+        "https"
+    } else {
+        "http"
+    };
     format!("{proto}://{host}")
+}
+
+fn safe_public_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    !rest.is_empty()
+        && !rest.contains("://")
+        && url
+            .chars()
+            .all(|ch| !ch.is_whitespace() && ch != '<' && ch != '>' && ch != '"' && ch != '\'')
+}
+
+fn safe_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+        })
 }

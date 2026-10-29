@@ -99,11 +99,56 @@ pub fn execute() -> anyhow::Result<()> {
         Command::Switch { target } => {
             println!("{}", open_repo()?.checkout(&target, false)?);
         }
-        Command::Merge { branch } => {
+        Command::Merge {
+            branch,
+            abort,
+            ff_only,
+            no_ff,
+            strategy,
+            option,
+        } => {
             let repo = open_repo()?;
+            if abort {
+                if branch.is_some() {
+                    bail!("--abort 不能同时指定分支");
+                }
+                repo.merge_abort()?;
+                println!("已取消合并");
+                return Ok(());
+            }
+            if ff_only && no_ff {
+                bail!("不能同时使用 --ff-only 和 --no-ff");
+            }
+            let Some(branch) = branch else {
+                bail!("请指定要合并的分支");
+            };
+            let mut favor = 0i8;
+            for item in &option {
+                match item.as_str() {
+                    "ours" => favor = 1,
+                    "theirs" => favor = -1,
+                    other => bail!("不支持的合并选项: {other}"),
+                }
+            }
+            let strategy_ours = match strategy.as_deref() {
+                None | Some("ort") | Some("recursive") => false,
+                Some("ours") => true,
+                Some(other) => bail!("不支持的合并策略: {other}"),
+            };
             let oid = repo.rev_parse(&branch)?;
             let (name, email) = identity::load_identity();
-            match repo.merge_oid(oid, &branch, &identity::signature_now(&name, &email))? {
+            match repo.merge_with(
+                oid,
+                &branch,
+                &identity::signature_now(&name, &email),
+                &crate::git::MergeOptions {
+                    no_ff,
+                    ff_only,
+                    strategy_ours,
+                    favor,
+                    diff3: false,
+                },
+            )? {
                 crate::git::MergeOutcome::UpToDate => println!("已经是最新"),
                 crate::git::MergeOutcome::FastForward(oid) => println!("快进到 {}", oid.short()),
                 crate::git::MergeOutcome::Merged(oid) => println!("已合并为 {}", oid.short()),
@@ -422,6 +467,7 @@ fn print_group(title: &str, entries: &[crate::git::StatusEntry]) {
             ChangeKind::Added => "新文件",
             ChangeKind::Modified => "修改",
             ChangeKind::Deleted => "删除",
+            ChangeKind::Unmerged => "冲突",
         };
         println!("  {label}: {}", entry.path);
     }
@@ -485,8 +531,25 @@ enum Command {
     },
     /// 切换分支
     Switch { target: String },
-    /// 合并分支或提交
-    Merge { branch: String },
+    /// 合并分支或提交。默认行级三方合并
+    Merge {
+        branch: Option<String>,
+        /// 放弃进行中的合并，工作区回到合并前
+        #[arg(long)]
+        abort: bool,
+        /// 只能快进
+        #[arg(long)]
+        ff_only: bool,
+        /// 即使可以快进也生成合并提交
+        #[arg(long)]
+        no_ff: bool,
+        /// 合并策略。`ours` 保留当前内容并记录这次合并
+        #[arg(short = 's', long = "strategy")]
+        strategy: Option<String>,
+        /// 冲突处理。`ours` 或 `theirs` 采用对应一侧的冲突块
+        #[arg(short = 'X')]
+        option: Vec<String>,
+    },
     /// 推送到 origin。越权修改会变成评审，不会直接进入分支
     Push {
         #[arg(long)]

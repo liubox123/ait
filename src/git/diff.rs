@@ -3,6 +3,7 @@ pub enum ChangeKind {
     Added,
     Modified,
     Deleted,
+    Unmerged,
 }
 
 impl ChangeKind {
@@ -11,6 +12,7 @@ impl ChangeKind {
             ChangeKind::Added => "added",
             ChangeKind::Modified => "modified",
             ChangeKind::Deleted => "deleted",
+            ChangeKind::Unmerged => "unmerged",
         }
     }
 
@@ -19,6 +21,7 @@ impl ChangeKind {
             ChangeKind::Added => "新文件",
             ChangeKind::Modified => "修改",
             ChangeKind::Deleted => "删除",
+            ChangeKind::Unmerged => "冲突",
         }
     }
 }

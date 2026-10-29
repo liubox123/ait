@@ -13,7 +13,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{valid_branch, Object, Oid, Repository};
-use crate::identity::{password_eq, password_hash, random_token, valid_repo_name, valid_user_name};
+use crate::identity::{
+    password_hash, password_is_current, password_matches, random_token, token_id, valid_repo_name,
+    valid_user_name,
+};
 use crate::perm::{Access, Duty, Manifest, Policy, Rule};
 use crate::plan::{self, Assignment};
 
@@ -301,7 +304,6 @@ impl Store {
     }
 
     pub fn register(&self, name: &str, password: &str) -> Result<AuthSession, ApiError> {
-        let _guard = self.lock();
         if !valid_user_name(name) {
             return Err(ApiError::bad(
                 "用户名只能包含字母、数字、点、下划线和短横线",
@@ -310,16 +312,31 @@ impl Store {
         if password.is_empty() {
             return Err(ApiError::bad("密码不能为空"));
         }
+        let salt = {
+            let _guard = self.lock();
+            let users = self.users()?;
+            if !users.is_empty() && !registration_open() {
+                return Err(ApiError::forbidden("已关闭公开注册"));
+            }
+            if users.iter().any(|user| user.name == name) {
+                return Err(ApiError::conflict("用户已存在"));
+            }
+            random_token()
+        };
+        let password_hash = password_hash(&salt, password);
+        let _guard = self.lock();
         let mut users = self.users()?;
+        if !users.is_empty() && !registration_open() {
+            return Err(ApiError::forbidden("已关闭公开注册"));
+        }
         if users.iter().any(|user| user.name == name) {
             return Err(ApiError::conflict("用户已存在"));
         }
         let admin = users.is_empty();
-        let salt = random_token();
         users.push(UserRecord {
             name: name.to_string(),
-            salt: salt.clone(),
-            password_hash: password_hash(&salt, password),
+            salt,
+            password_hash,
             admin,
         });
         self.save_users(&users)?;
@@ -327,28 +344,58 @@ impl Store {
     }
 
     pub fn login(&self, name: &str, password: &str) -> Result<AuthSession, ApiError> {
-        let _guard = self.lock();
-        let users = self.users()?;
-        let Some(user) = users.iter().find(|user| user.name == name) else {
-            return Err(ApiError::unauthorized("用户名或密码错误"));
+        let snapshot = {
+            let _guard = self.lock();
+            let users = self.users()?;
+            users
+                .iter()
+                .find(|user| user.name == name)
+                .map(|user| (user.salt.clone(), user.password_hash.clone()))
         };
-        if !password_eq(&user.password_hash, &password_hash(&user.salt, password)) {
+        let known = snapshot.is_some();
+        let (salt, stored) = match snapshot {
+            Some(found) => found,
+            None => ("ait-unknown-user".to_string(), unknown_password_hash()),
+        };
+        let ok = password_matches(&stored, &salt, password);
+        if !known || !ok {
             return Err(ApiError::unauthorized("用户名或密码错误"));
         }
-        self.issue_token(name)
+        let upgraded = if password_is_current(&stored) {
+            None
+        } else {
+            Some(password_hash(&salt, password))
+        };
+        let _guard = self.lock();
+        let mut users = self.users()?;
+        let Some(index) = users.iter().position(|user| user.name == name) else {
+            return Err(ApiError::unauthorized("用户名或密码错误"));
+        };
+        if users[index].salt != salt {
+            if !password_matches(&users[index].password_hash, &users[index].salt, password) {
+                return Err(ApiError::unauthorized("用户名或密码错误"));
+            }
+        } else if let Some(password_hash) = upgraded {
+            if !password_is_current(&users[index].password_hash) {
+                users[index].password_hash = password_hash;
+                self.save_users(&users)?;
+            }
+        }
+        let name = users[index].name.clone();
+        self.issue_token(&name)
     }
 
     pub fn logout(&self, token: &str) -> Result<(), ApiError> {
         let _guard = self.lock();
         let mut tokens = self.tokens()?;
-        tokens.remove(token);
+        tokens.remove(&token_id(token));
         self.save_tokens(&tokens)
     }
 
     pub fn authenticate(&self, token: &str) -> Result<AuthSession, ApiError> {
         let _guard = self.lock();
         let tokens = self.tokens()?;
-        let Some(name) = tokens.get(token) else {
+        let Some(name) = tokens.get(&token_id(token)) else {
             return Err(ApiError::unauthorized("登录已失效"));
         };
         let users = self.users()?;
@@ -375,7 +422,7 @@ impl Store {
             .ok_or_else(|| ApiError::bad("用户不存在"))?;
         let mut tokens = self.tokens()?;
         let token = random_token();
-        tokens.insert(token.clone(), name.to_string());
+        tokens.insert(token_id(&token), name.to_string());
         self.save_tokens(&tokens)?;
         Ok(AuthSession {
             token,
@@ -735,17 +782,6 @@ impl Store {
         }
         let reference = normalize_branch(&request.reference)?;
         let repo = self.open_git(name)?;
-        for object in &request.objects {
-            let bytes = STANDARD
-                .decode(object.payload_b64.trim())
-                .map_err(|_| ApiError::bad("对象内容不是合法的 base64"))?;
-            repo.ingest(&object.kind, &bytes).map_err(git_err)?;
-        }
-        ensure_complete(&repo, request.new_oid)?;
-        let current = repo
-            .resolve_ref(&reference)
-            .map_err(git_err)?
-            .unwrap_or(Oid::ZERO);
         let policy = self.policy_of(name)?;
         let owner = policy.is_owner(user, admin);
         let protected = is_protected(&reference);
@@ -765,11 +801,22 @@ impl Store {
         if request.force && !can_force {
             return Err(ApiError::forbidden("只有仓库所有者可以强制推送"));
         }
+        let current = repo
+            .resolve_ref(&reference)
+            .map_err(git_err)?
+            .unwrap_or(Oid::ZERO);
         if current != request.old_oid && !(request.force && can_force) {
             return Err(ApiError::conflict(format!(
                 "远端 {reference} 已是 {current}，请先拉取"
             )));
         }
+        for object in &request.objects {
+            let bytes = STANDARD
+                .decode(object.payload_b64.trim())
+                .map_err(|_| ApiError::bad("对象内容不是合法的 base64"))?;
+            repo.ingest(&object.kind, &bytes).map_err(git_err)?;
+        }
+        ensure_complete(&repo, request.new_oid)?;
         if !current.is_zero() && current != request.new_oid && !(request.force && can_force) {
             let fast_forward = repo
                 .is_ancestor(current, request.new_oid)
@@ -1484,6 +1531,23 @@ pub struct AuthSession {
     pub admin: bool,
 }
 
+fn registration_open() -> bool {
+    match std::env::var("AIT_ALLOW_REGISTER") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+fn unknown_password_hash() -> String {
+    use std::sync::OnceLock;
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| password_hash("ait-unknown-user", "\0"))
+        .clone()
+}
+
 fn can_approve(
     manifest: &Manifest,
     policy: &Policy,
@@ -1618,4 +1682,29 @@ fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> anyhow::Result<(
 
 fn io_err(err: anyhow::Error) -> ApiError {
     ApiError::bad(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_is_hashed_at_rest_and_bad_logins_look_the_same() {
+        let root = std::env::temp_dir().join(format!("ait-auth-{}", random_token()));
+        let store = Store::open(root.clone()).unwrap();
+        let session = store.register("alice", "secret").unwrap();
+        let tokens = std::fs::read_to_string(root.join("tokens.json")).unwrap();
+        assert!(!tokens.contains(&session.token), "{tokens}");
+        assert!(tokens.contains(&crate::identity::token_id(&session.token)));
+        assert_eq!(store.authenticate(&session.token).unwrap().user, "alice");
+        store.logout(&session.token).unwrap();
+        assert!(store.authenticate(&session.token).is_err());
+        let wrong = store.login("alice", "nope").unwrap_err();
+        let missing = store.login("nobody", "nope").unwrap_err();
+        assert_eq!(wrong.status, missing.status);
+        assert_eq!(wrong.message, missing.message);
+        assert!(store.create_repo("alice", false, "..", "").is_err());
+        assert!(store.repo_summary("..", "http://127.0.0.1:7878").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
